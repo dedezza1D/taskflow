@@ -5,9 +5,11 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/dedezza1D/taskflow/internal/observability"
 	"github.com/dedezza1D/taskflow/internal/queue"
 	"github.com/dedezza1D/taskflow/internal/store"
 	"github.com/gorilla/mux"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 )
 
@@ -25,11 +27,29 @@ type Config struct {
 func NewServer(cfg Config, logger *zap.Logger, st *store.Store, q *queue.Queue) *Server {
 	r := mux.NewRouter()
 
+routeName := func(r *http.Request) string {
+	if rt := mux.CurrentRoute(r); rt != nil {
+		if tpl, err := rt.GetPathTemplate(); err == nil && tpl != "" {
+			return tpl
+		}
+	}
+	return r.URL.Path
+}
+
+// Middlewares (order matters)
+r.Use(observability.RequestIDMiddleware)
+r.Use(observability.TracingMiddleware(routeName))
+r.Use(observability.HTTPMetricsMiddleware(routeName))
+r.Use(observability.AccessLogMiddleware(logger, routeName))
+
 	srv := &Server{
 		logger: logger,
 		store:  st,
 		queue:  q,
 	}
+
+	// Metrics
+	r.Handle("/metrics", promhttp.Handler()).Methods(http.MethodGet)
 
 	// Health
 	r.HandleFunc("/api/v1/health", srv.handleHealth).Methods(http.MethodGet)

@@ -144,12 +144,13 @@ func mergeSubjects(existing, desired []string) ([]string, bool) {
 	return out, changed
 }
 
-func (q *Queue) PublishTask(ctx context.Context, subject string, msg TaskMessage) error {
+func (q *Queue) PublishTask(ctx context.Context, subject string, msg TaskMessage, hdr nats.Header) error {
 	b, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
-	_, err = q.js.Publish(subject, b)
+	m := &nats.Msg{Subject: subject, Data: b, Header: hdr}
+	_, err = q.js.PublishMsg(m)
 	return err
 }
 
@@ -157,11 +158,12 @@ func (q *Queue) JetStream() nats.JetStreamContext {
 	return q.js
 }
 
-func (q *Queue) PublishDLQ(ctx context.Context, msg DLQMessage) error {
+func (q *Queue) PublishDLQ(ctx context.Context, msg DLQMessage, hdr nats.Header) error {
 	b, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
-	_, err = q.js.Publish(SubjectDLQ, b)
+	m := &nats.Msg{Subject: SubjectDLQ, Data: b, Header: hdr}
+	_, err = q.js.PublishMsg(m)
 	return err
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/dedezza1D/taskflow/internal/config"
 	"github.com/dedezza1D/taskflow/internal/queue"
+	"github.com/nats-io/nats.go"
 )
 
 func main() {
@@ -50,7 +51,8 @@ func main() {
 	fmt.Printf("publishing %d time(s) to %s: %s\n", *count, *subject, string(b))
 
 	for i := 0; i < *count; i++ {
-		if err := q.PublishTask(context.Background(), *subject, msg); err != nil {
+		hdr := nats.Header{} // optional; empty is fine
+		if err := q.PublishTask(context.Background(), *subject, msg, hdr); err != nil {
 			panic(err)
 		}
 		time.Sleep(*interval)

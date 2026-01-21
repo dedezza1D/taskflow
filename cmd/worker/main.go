@@ -1,4 +1,3 @@
-// cmd/worker/main.go
 package main
 
 import (
@@ -6,19 +5,26 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/dedezza1D/taskflow/internal/config"
 	"github.com/dedezza1D/taskflow/internal/logging"
+	"github.com/dedezza1D/taskflow/internal/observability"
 	"github.com/dedezza1D/taskflow/internal/queue"
 	"github.com/dedezza1D/taskflow/internal/store"
 	workerpkg "github.com/dedezza1D/taskflow/internal/worker"
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.uber.org/zap"
 )
 
@@ -40,6 +46,27 @@ func main() {
 		panic(err)
 	}
 	defer func() { _ = logger.Sync() }()
+
+	observability.RegisterMetrics()
+
+	shutdownTracing, err := observability.InitTracing(context.Background(), observability.OTelConfig{
+		ServiceName: firstNonEmpty(cfg.OTELServiceName, "taskflow-worker"),
+		Endpoint:    cfg.OTELExporterOTLPEndpoint,
+		Env:         cfg.Env,
+	})
+	if err != nil {
+		logger.Fatal("otel init failed", zap.Error(err))
+	}
+	defer func() { _ = shutdownTracing(context.Background()) }()
+
+	// Metrics endpoint
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		addr := fmt.Sprintf(":%d", cfg.WorkerMetricsPort)
+		logger.Info("worker metrics server starting", zap.String("addr", addr))
+		_ = http.ListenAndServe(addr, mux)
+	}()
 
 	st, err := store.New(context.Background(), cfg.DatabaseURL)
 	if err != nil {
@@ -165,7 +192,15 @@ func handleMsg(
 	cfg *config.Config,
 	m *nats.Msg,
 ) (msgAction, int, error) {
-	// Attempt number must come from JetStream delivery count (not DB state)
+	// Extract trace context from NATS headers (if present)
+	if m.Header != nil {
+		ctx = otel.GetTextMapPropagator().Extract(ctx, observability.NATSHeaderCarrier{H: m.Header})
+	}
+	tr := otel.Tracer("taskflow/worker")
+	ctx, span := tr.Start(ctx, "taskflow.handle_msg")
+	defer span.End()
+
+	// Attempt number from JetStream delivery count
 	attempt := 1
 	if md, err := m.Metadata(); err == nil && md != nil && md.NumDelivered > 0 {
 		attempt = int(md.NumDelivered)
@@ -173,14 +208,24 @@ func handleMsg(
 
 	var tm queue.TaskMessage
 	if err := json.Unmarshal(m.Data, &tm); err != nil {
-		// bad message → ack so it doesn't poison the stream
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "bad_message")
 		return actionAck, attempt, err
 	}
 
 	taskID, err := uuid.Parse(tm.TaskID)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "bad_task_id")
 		return actionAck, attempt, err
 	}
+
+	span.SetAttributes(
+		attribute.String("messaging.subject", m.Subject),
+		attribute.String("task.id", taskID.String()),
+		attribute.String("task.priority", tm.Priority),
+		attribute.Int("task.attempt", attempt),
+	)
 
 	task, err := st.GetTask(ctx, taskID)
 	if err != nil {
@@ -190,35 +235,32 @@ func handleMsg(
 		return actionRetry, attempt, err
 	}
 
-	// terminal tasks should not be retried
+	// Terminal tasks should not be retried
 	if task.Status == store.StatusCompleted || task.Status == store.StatusFailed || task.Status == store.StatusCancelled {
 		return actionAck, attempt, nil
 	}
 
-	// if already processing, this is very likely a duplicate delivery; ack it
+	// If already processing, likely duplicate delivery
 	if task.Status == store.StatusProcessing {
 		return actionAck, attempt, nil
 	}
 
-	// Guard: if redelivery attempt already exceeded policy, fail permanently + DLQ
+	// Policy: attempts exceeded -> permanent fail + DLQ
 	if attempt > cfg.WorkerMaxAttempts {
 		return failPermanently(ctx, logger, st, q, task, attempt, fmt.Errorf("max attempts exceeded (%d)", cfg.WorkerMaxAttempts), m)
 	}
 
-	// --- CLAIM FIRST (prevents duplicate side-effects) ---
+	// Claim first (prevents duplicate side-effects)
 	processing, err := tryUpdateStatus(ctx, st, taskID, store.StatusProcessing)
 	if err != nil {
 		if errors.Is(err, store.ErrVersionConflict) {
-			// another worker likely took it
 			return actionAck, attempt, nil
 		}
 		return actionRetry, attempt, err
 	}
 
-	// After claiming, re-check handler availability
 	h, ok := registry.Get(task.Type)
 	if !ok {
-		// Mark failed + DLQ with the claim in place (prevents double-fail)
 		return failPermanentlyClaimed(ctx, logger, st, q, task, processing.Version, attempt,
 			fmt.Errorf("no handler registered for type %q", task.Type), m)
 	}
@@ -240,7 +282,11 @@ func handleMsg(
 	}
 
 	// Run handler
+	observability.TasksStartedTotal.WithLabelValues(task.Type, tm.Priority).Inc()
+	start := time.Now()
 	runErr := h(ctx, task)
+	observability.TaskDuration.WithLabelValues(task.Type).Observe(time.Since(start).Seconds())
+
 	if runErr == nil {
 		if err := finishExecutionSucceeded(ctx, st, exec.ID); err != nil {
 			_ = safeSetQueued(ctx, st, taskID)
@@ -252,6 +298,8 @@ func handleMsg(
 			return actionRetry, attempt, err
 		}
 
+		observability.TasksCompletedTotal.WithLabelValues(task.Type).Inc()
+
 		logger.Info("task processed",
 			zap.String("task_id", taskID.String()),
 			zap.Int("attempt", attempt),
@@ -260,16 +308,24 @@ func handleMsg(
 		return actionAck, attempt, nil
 	}
 
-	// failure: record failed execution
+	span.RecordError(runErr)
+	span.SetStatus(codes.Error, runErr.Error())
+
+	// Failure: record failed execution
+	reason := "retryable"
+	if workerpkg.IsPermanent(runErr) {
+		reason = "permanent"
+	}
+	observability.TasksFailedTotal.WithLabelValues(task.Type, reason).Inc()
+
 	if err := finishExecutionFailed(ctx, st, exec.ID, runErr); err != nil {
 		_ = safeSetQueued(ctx, st, taskID)
 		return actionRetry, attempt, err
 	}
 
-	// permanent failure stops retries + publish DLQ
+	// Permanent failure -> DLQ + mark failed
 	if workerpkg.IsPermanent(runErr) {
 		publishDLQBestEffort(ctx, logger, q, task, attempt, runErr, m)
-
 		_, _ = st.UpdateTaskStatus(ctx, taskID, processing.Version, store.StatusFailed)
 
 		logger.Error("task permanently failed",
@@ -281,10 +337,9 @@ func handleMsg(
 		return actionAck, attempt, nil
 	}
 
-	// transient failure: if max attempts reached, fail task + publish DLQ
+	// Transient failure: if max attempts reached -> DLQ + mark failed
 	if attempt >= cfg.WorkerMaxAttempts {
 		publishDLQBestEffort(ctx, logger, q, task, attempt, runErr, m)
-
 		_, _ = st.UpdateTaskStatus(ctx, taskID, processing.Version, store.StatusFailed)
 
 		logger.Error("task failed (max attempts reached)",
@@ -296,7 +351,7 @@ func handleMsg(
 		return actionAck, attempt, nil
 	}
 
-	// re-queue for visibility and retry later
+	// Re-queue and retry later
 	_ = safeSetQueued(ctx, st, taskID)
 
 	logger.Warn("task failed, will retry",
@@ -313,6 +368,7 @@ func publishDLQBestEffort(ctx context.Context, logger *zap.Logger, q *queue.Queu
 	if q == nil || task == nil || reason == nil || m == nil {
 		return
 	}
+
 	dlq := queue.DLQMessage{
 		TaskID:       task.ID.String(),
 		TaskType:     task.Type,
@@ -322,7 +378,12 @@ func publishDLQBestEffort(ctx context.Context, logger *zap.Logger, q *queue.Queu
 		OriginalData: m.Data,
 		FailedAt:     time.Now(),
 	}
-	if err := q.PublishDLQ(ctx, dlq); err != nil {
+
+	hdr := nats.Header{}
+	otel.GetTextMapPropagator().Inject(ctx, observability.NATSHeaderCarrier{H: hdr})
+	hdr.Set("task_id", task.ID.String())
+
+	if err := q.PublishDLQ(ctx, dlq, hdr); err != nil {
 		logger.Error("failed to publish DLQ message", zap.Error(err), zap.String("task_id", task.ID.String()))
 	}
 }
@@ -344,8 +405,6 @@ func computeBackoff(base, max time.Duration, attempt int) time.Duration {
 	return d
 }
 
-// failPermanentlyClaimed assumes we already successfully transitioned the task to processing.
-// This prevents duplicate side-effects on fast redelivery.
 func failPermanentlyClaimed(
 	ctx context.Context,
 	logger *zap.Logger,
@@ -357,7 +416,6 @@ func failPermanentlyClaimed(
 	reason error,
 	m *nats.Msg,
 ) (msgAction, int, error) {
-	// Best-effort execution row for this delivery attempt
 	exec, err := st.CreateExecution(ctx, task.ID, attempt)
 	if err == nil {
 		_ = finishExecutionFailed(ctx, st, exec.ID, reason)
@@ -365,10 +423,7 @@ func failPermanentlyClaimed(
 		// already recorded
 	}
 
-	// Publish DLQ (best effort)
 	publishDLQBestEffort(ctx, logger, q, task, attempt, reason, m)
-
-	// Mark task failed using the claimed version
 	_, _ = st.UpdateTaskStatus(ctx, task.ID, processingVersion, store.StatusFailed)
 
 	logger.Error("task permanently failed",
@@ -381,7 +436,6 @@ func failPermanentlyClaimed(
 	return actionAck, attempt, nil
 }
 
-// Kept for other “fail without claim” usages if needed
 func failPermanently(
 	ctx context.Context,
 	logger *zap.Logger,
@@ -392,7 +446,6 @@ func failPermanently(
 	reason error,
 	m *nats.Msg,
 ) (msgAction, int, error) {
-	// Best-effort execution row for this delivery attempt
 	exec, err := st.CreateExecution(ctx, task.ID, attempt)
 	if err == nil {
 		_ = finishExecutionFailed(ctx, st, exec.ID, reason)
@@ -455,4 +508,13 @@ func finishExecutionFailed(ctx context.Context, st *store.Store, execID uuid.UUI
 	msg := cause.Error()
 	_, err := st.FinishExecution(ctx, execID, store.ExecFailed, &msg)
 	return err
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }

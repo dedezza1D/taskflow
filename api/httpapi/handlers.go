@@ -6,10 +6,13 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/dedezza1D/taskflow/internal/observability"
 	"github.com/dedezza1D/taskflow/internal/queue"
 	"github.com/dedezza1D/taskflow/internal/store"
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
+	"github.com/nats-io/nats.go"
+	"go.opentelemetry.io/otel"
 	"go.uber.org/zap"
 )
 
@@ -88,12 +91,20 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Best-effort enqueue (MVP). Task stays in DB even if enqueue fails.
 	if s.queue != nil {
+		hdr := nats.Header{}
+
+		if rid, ok := observability.RequestIDFromContext(r.Context()); ok && rid != "" {
+			hdr.Set("X-Request-Id", rid)
+		}
+
+		otel.GetTextMapPropagator().Inject(r.Context(), observability.NATSHeaderCarrier{H: hdr})
+
 		err := s.queue.PublishTask(r.Context(), subject, queue.TaskMessage{
 			TaskID:   task.ID.String(),
 			Priority: string(task.Priority),
-		})
+		}, hdr)
+
 		if err != nil {
 			s.logger.Warn("failed to enqueue task", zap.Error(err), zap.String("task_id", task.ID.String()))
 		}
