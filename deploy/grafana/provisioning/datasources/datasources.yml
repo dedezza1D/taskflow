@@ -1,0 +1,29 @@
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    jsonData:
+      tracesToLogs:
+        datasourceUid: Loki
+        tags: ["service.name", "task_id", "request_id"]
+        mappedTags: [{ key: "service.name", value: "service" }]
+        mapTagNamesEnabled: true
+        spanStartTimeShift: "1h"
+        spanEndTimeShift: "1h"
+      lokiSearch:
+        datasourceUid: Loki
+      serviceMap:
+        datasourceUid: Prometheus
+      nodeGraph:
+        enabled: true
