@@ -12,6 +12,10 @@ type Config struct {
 	HTTPPort string
 	LogLevel string
 
+	// OpenTelemetry (traces)
+	OTELExporterOTLPEndpoint string
+	OTELServiceName           string
+
 	DatabaseURL string
 
 	NATSURL          string
@@ -21,6 +25,7 @@ type Config struct {
 	WorkerPollTimeout time.Duration
 	WorkerConcurrency int
 	WorkerMaxAttempts int
+	WorkerMetricsPort int
 	WorkerBackoffBase time.Duration
 	WorkerBackoffMax  time.Duration
 }
@@ -31,6 +36,9 @@ func Load() *Config {
 		HTTPPort: getEnv("HTTP_PORT", "8080"),
 		LogLevel: getEnv("LOG_LEVEL", "info"),
 
+		OTELExporterOTLPEndpoint: getEnv("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+		OTELServiceName:           getEnv("OTEL_SERVICE_NAME", ""),
+
 		DatabaseURL: getEnv("DATABASE_URL", "postgres://taskflow:taskflow@localhost:5432/taskflow?sslmode=disable"),
 
 		NATSURL:          getEnv("NATS_URL", "nats://localhost:4222"),
@@ -40,6 +48,7 @@ func Load() *Config {
 		WorkerPollTimeout: getEnvAsDuration("WORKER_POLL_TIMEOUT", 2*time.Second),
 		WorkerConcurrency: getEnvAsInt("WORKER_CONCURRENCY", 10),
 		WorkerMaxAttempts: getEnvAsInt("WORKER_MAX_ATTEMPTS", 5),
+		WorkerMetricsPort: getEnvAsInt("WORKER_METRICS_PORT", 9091),
 		WorkerBackoffBase: getEnvAsDuration("WORKER_BACKOFF_BASE", 500*time.Millisecond),
 		WorkerBackoffMax:  getEnvAsDuration("WORKER_BACKOFF_MAX", 10*time.Second),
 	}
