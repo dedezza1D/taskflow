@@ -6,13 +6,10 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/dedezza1D/taskflow/internal/observability"
-	"github.com/dedezza1D/taskflow/internal/queue"
+	"github.com/dedezza1D/taskflow/internal/pipeline"
 	"github.com/dedezza1D/taskflow/internal/store"
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
-	"github.com/nats-io/nats.go"
-	"go.opentelemetry.io/otel"
 	"go.uber.org/zap"
 )
 
@@ -60,21 +57,25 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "validation_error", "payload is required")
 		return
 	}
+	// Pipeline tasks are minted only by POST /documents, which checks that the
+	// document is the caller's. Accepting one here would let a payload name any
+	// document id — another tenant's included — and have the worker process it.
+	if req.Type == pipeline.TaskType {
+		writeErr(w, http.StatusBadRequest, "validation_error",
+			"type "+pipeline.TaskType+" is reserved; upload through /api/v1/documents")
+		return
+	}
 
 	priority := store.PriorityNormal
-	subject := queue.SubjectNormal
 
 	if req.Priority != "" {
 		switch req.Priority {
 		case "low":
 			priority = store.PriorityLow
-			subject = queue.SubjectLow
 		case "normal":
 			priority = store.PriorityNormal
-			subject = queue.SubjectNormal
 		case "high":
 			priority = store.PriorityHigh
-			subject = queue.SubjectHigh
 		default:
 			writeErr(w, http.StatusBadRequest, "validation_error", "priority must be low|normal|high")
 			return
@@ -85,30 +86,17 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		Type:     req.Type,
 		Payload:  []byte(req.Payload),
 		Priority: priority,
+		OrgID:    principal(r).OrgID,
 	})
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "internal_error", err.Error())
+		// The raw error can carry SQL and schema detail; that belongs in the
+		// log, not in a response body.
+		s.logger.Error("create task failed", zap.Error(err))
+		writeErr(w, http.StatusInternalServerError, "internal_error", "failed to create task")
 		return
 	}
 
-	if s.queue != nil {
-		hdr := nats.Header{}
-
-		if rid, ok := observability.RequestIDFromContext(r.Context()); ok && rid != "" {
-			hdr.Set("X-Request-Id", rid)
-		}
-
-		otel.GetTextMapPropagator().Inject(r.Context(), observability.NATSHeaderCarrier{H: hdr})
-
-		err := s.queue.PublishTask(r.Context(), subject, queue.TaskMessage{
-			TaskID:   task.ID.String(),
-			Priority: string(task.Priority),
-		}, hdr)
-
-		if err != nil {
-			s.logger.Warn("failed to enqueue task", zap.Error(err), zap.String("task_id", task.ID.String()))
-		}
-	}
+	s.publishTaskMessage(r, task)
 
 	writeJSON(w, http.StatusCreated, createTaskResponse{Task: *task})
 }
@@ -125,13 +113,16 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	task, err := s.store.GetTask(r.Context(), id)
+	task, err := s.store.GetTaskForOrg(r.Context(), id, principal(r).OrgID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "not_found", "task not found")
 			return
 		}
-		writeErr(w, http.StatusInternalServerError, "internal_error", err.Error())
+		// The raw error can carry SQL and schema detail; that belongs in the
+		// log, not in a response body.
+		s.logger.Error("get task failed", zap.Error(err))
+		writeErr(w, http.StatusInternalServerError, "internal_error", "failed to load task")
 		return
 	}
 
@@ -184,14 +175,17 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		offset = n
 	}
 
-	items, err := s.store.ListTasks(r.Context(), store.ListTasksParams{
+	items, err := s.store.ListTasksForOrg(r.Context(), principal(r).OrgID, store.ListTasksParams{
 		Status: status,
 		Type:   taskType,
 		Limit:  limit,
 		Offset: offset,
 	})
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "internal_error", err.Error())
+		// The raw error can carry SQL and schema detail; that belongs in the
+		// log, not in a response body.
+		s.logger.Error("list tasks failed", zap.Error(err))
+		writeErr(w, http.StatusInternalServerError, "internal_error", "failed to list tasks")
 		return
 	}
 
@@ -225,9 +219,25 @@ func (s *Server) handleListExecutions(w http.ResponseWriter, r *http.Request) {
 		limit = n
 	}
 
+	// Executions carry no tenant of their own; they inherit the task's. Checking
+	// ownership first also makes another tenant's task a 404 here, not an empty
+	// list that would still confirm the id exists.
+	if _, err := s.store.GetTaskForOrg(r.Context(), taskID, principal(r).OrgID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found", "task not found")
+			return
+		}
+		s.logger.Error("get task failed", zap.Error(err))
+		writeErr(w, http.StatusInternalServerError, "internal_error", "failed to load task")
+		return
+	}
+
 	items, err := s.store.ListExecutions(r.Context(), taskID, limit)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "internal_error", err.Error())
+		// The raw error can carry SQL and schema detail; that belongs in the
+		// log, not in a response body.
+		s.logger.Error("list executions failed", zap.Error(err))
+		writeErr(w, http.StatusInternalServerError, "internal_error", "failed to list executions")
 		return
 	}
 

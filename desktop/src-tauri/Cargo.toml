@@ -1,0 +1,22 @@
+[package]
+name = "taskflow-desktop-shell"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "Native window around the TaskFlow Compliance local server"
+license = "MIT"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+
+[profile.release]
+# A desktop shell is not a hot path; optimise for a small installer instead.
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

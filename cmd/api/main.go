@@ -11,6 +11,8 @@ import (
 	"github.com/dedezza1D/taskflow/api/httpapi"
 	"github.com/dedezza1D/taskflow/internal/config"
 	"github.com/dedezza1D/taskflow/internal/logging"
+	"github.com/dedezza1D/taskflow/internal/mail"
+	"github.com/dedezza1D/taskflow/internal/objects"
 	"github.com/dedezza1D/taskflow/internal/observability"
 	"github.com/dedezza1D/taskflow/internal/queue"
 	"github.com/dedezza1D/taskflow/internal/store"
@@ -61,8 +63,55 @@ func main() {
 	}
 	defer q.Close()
 
+	// Object storage (document bytes live here — payloads carry references only)
+	obj, err := objects.NewFS(cfg.ObjectsDir)
+	if err != nil {
+		logger.Fatal("object store init failed", zap.Error(err))
+	}
+
 	// HTTP server
-	server := httpapi.NewServer(httpapi.Config{Port: cfg.HTTPPort}, logger, st, q)
+	if !cfg.AuthEnabled {
+		logger.Warn("authentication is DISABLED — every request runs as a local admin; " +
+			"only correct for a single-user desktop install on loopback")
+	}
+
+	// Password recovery is opt-in: no mailer, no recovery endpoints. That is the
+	// correct default for the desktop build and for any deployment that has not
+	// decided where its mail comes from.
+	var mailer mail.Sender
+	switch {
+	case cfg.MailLogOnlyMode:
+		logger.Warn("MAIL_LOG_ONLY is on — recovery links are printed to the log, " +
+			"which means anyone who can read logs can take over an account")
+		mailer = mail.NewLogSender(logger)
+	case cfg.SMTPHost != "":
+		s, err := mail.NewSMTP(mail.Config{
+			Host:     cfg.SMTPHost,
+			Port:     cfg.SMTPPort,
+			Username: cfg.SMTPUsername,
+			Password: cfg.SMTPPassword,
+			From:     cfg.SMTPFrom,
+			StartTLS: cfg.SMTPStartTLS,
+		}, logger)
+		if err != nil {
+			logger.Fatal("smtp configuration invalid", zap.Error(err))
+		}
+		mailer = s
+	default:
+		logger.Info("password recovery disabled (no SMTP_HOST configured)")
+	}
+
+	server := httpapi.NewServer(httpapi.Config{
+		Port:           cfg.HTTPPort,
+		Objects:        obj,
+		MaxUploadBytes: cfg.MaxUploadBytes,
+		AuthEnabled:    cfg.AuthEnabled,
+		SecureCookies:  cfg.SecureCookies,
+		SessionTTL:     cfg.SessionTTL,
+		Mailer:         mailer,
+		BaseURL:        cfg.AppBaseURL,
+		ResetTTL:       cfg.ResetTokenTTL,
+	}, logger, st, q)
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)

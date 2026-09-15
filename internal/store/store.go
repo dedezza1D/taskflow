@@ -7,10 +7,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Store is the repository. It holds a DB rather than a concrete pool, so the
+// same 42 methods serve the served deployment (Postgres) and the desktop build
+// (a local file) without being written twice.
 type Store struct {
-	db *pgxpool.Pool
+	db DB
 }
 
+// New opens the Postgres-backed store.
 func New(ctx context.Context, databaseURL string) (*Store, error) {
 	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
@@ -34,7 +38,13 @@ func New(ctx context.Context, databaseURL string) (*Store, error) {
 		return nil, err
 	}
 
-	return &Store{db: pool}, nil
+	return &Store{db: &postgresDB{pool: pool}}, nil
+}
+
+// NewWithDB builds a store on an already-constructed driver — the entry point a
+// non-Postgres backend uses.
+func NewWithDB(db DB) *Store {
+	return &Store{db: db}
 }
 
 func (s *Store) Close() {

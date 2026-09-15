@@ -1,0 +1,10 @@
+# Everything git detects as text is stored with LF, whatever the working copy
+# uses. Files edited on Windows arrive with CRLF, and committing them as-is turns
+# a one-line change into a whole-file diff. First, so the rules below refine it.
+* text=auto
+
+# Keep Go sources as LF in the repo and on checkout, on every OS.
+# Without this, a Windows checkout (autocrlf) reintroduces CRLF and `gofmt -l`
+# flags every file, failing the CI gofmt gate. (.sh is worth adding too if the
+# smoke script ever ships CRLF.)
+*.go text eol=lf

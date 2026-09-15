@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,17 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dedezza1D/taskflow/internal/store"
 	"go.uber.org/zap"
 )
 
 func TestTasksAPI_CreateThenGet(t *testing.T) {
-	// Connect store (Postgres must be running + migration applied)
-	dsn := "postgres://taskflow:taskflow@localhost:5432/taskflow?sslmode=disable"
-	st, err := store.New(context.Background(), dsn)
-	if err != nil {
-		t.Fatalf("store.New: %v", err)
-	}
+	st := mustStore(t)
 	defer st.Close()
 
 	logger := zap.NewNop()

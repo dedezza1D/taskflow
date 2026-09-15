@@ -1,0 +1,12 @@
+-- Drop the org_id default that stood in while there was no auth code.
+--
+-- Migration 003 shipped the tenancy schema before any Go code used it, so
+-- documents.org_id carried a default pointing at the "legacy" organisation just
+-- to keep inserts working. Now that the API sets org_id from the authenticated
+-- principal, the default is worse than useless: it would let a code path that
+-- forgets to pass a tenant file documents under an organisation whose members
+-- can then read them. Better to fail the insert.
+--
+-- 003 no longer adds the default for fresh databases; this handles the ones
+-- that already ran it.
+ALTER TABLE documents ALTER COLUMN org_id DROP DEFAULT;

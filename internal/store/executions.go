@@ -6,30 +6,48 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
-func (s *Store) CreateExecution(ctx context.Context, taskID uuid.UUID, attempt int) (*TaskExecution, error) {
+// CreateExecution records a new execution attempt for a task. The attempt number
+// is assigned from the execution ledger (MAX(attempt)+1) in a single statement, so
+// it is durable and independent of the broker's delivery count — a republished or
+// redelivered message always advances the attempt rather than colliding with a
+// prior one. The unique (task_id, attempt) index remains the concurrency guard: if
+// two deliveries race, one wins and the other gets ErrAlreadyExists.
+func (s *Store) CreateExecution(ctx context.Context, taskID uuid.UUID) (*TaskExecution, error) {
 	id := uuid.New()
 	q := `
 INSERT INTO task_executions (id, task_id, attempt, status)
-VALUES ($1, $2, $3, 'started')
+VALUES ($1, $2, (SELECT COALESCE(MAX(attempt), 0) + 1 FROM task_executions WHERE task_id = $2), 'started')
 RETURNING id, task_id, attempt, status, error, started_at, finished_at;
 `
 	var e TaskExecution
-	err := s.db.QueryRow(ctx, q, id, taskID, attempt).Scan(
+	err := s.db.QueryRow(ctx, q, id, taskID).Scan(
 		&e.ID, &e.TaskID, &e.Attempt, &e.Status, &e.Error, &e.StartedAt, &e.FinishedAt,
 	)
 	if err != nil {
-		// Idempotency: if another worker already inserted (task_id, attempt), treat as "already exists".
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		// Concurrency: if another worker just inserted the same (task_id, attempt), treat as "already exists".
+		if errors.Is(err, ErrUniqueViolation) {
 			return nil, ErrAlreadyExists
 		}
 		return nil, err
 	}
 	return &e, nil
+}
+
+// MaxAttempt returns the highest attempt number recorded for a task, or 0 if the
+// task has no executions yet. It is the durable source of truth for both the
+// worker's attempt cap and the reconciler's lost-enqueue vs crash-pill decision.
+func (s *Store) MaxAttempt(ctx context.Context, taskID uuid.UUID) (int, error) {
+	var n int
+	err := s.db.QueryRow(ctx,
+		`SELECT COALESCE(MAX(attempt), 0) FROM task_executions WHERE task_id = $1`,
+		taskID,
+	).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 func (s *Store) FinishExecution(ctx context.Context, execID uuid.UUID, status ExecutionStatus, errMsg *string) (*TaskExecution, error) {
@@ -47,7 +65,7 @@ RETURNING id, task_id, attempt, status, error, started_at, finished_at;
 	err := s.db.QueryRow(ctx, q, execID, string(status), errMsg, now).Scan(
 		&e.ID, &e.TaskID, &e.Attempt, &e.Status, &e.Error, &e.StartedAt, &e.FinishedAt,
 	)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {

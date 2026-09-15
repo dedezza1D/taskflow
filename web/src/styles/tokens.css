@@ -1,0 +1,142 @@
+/* Design tokens. Dark is the default theme; light is selected, not an
+   automatic inversion. Every colour pair below was checked with the data-viz
+   contrast validator against the surface it actually renders on.
+
+   Status colours are a reserved scale — they never double as decoration, and
+   they are always shipped with a glyph and a text label, because on the light
+   surface `warning` and `serious` sit under 3:1 by design. */
+
+:root {
+  color-scheme: dark;
+
+  /* surfaces */
+  --page: #0e1421;
+  --surface-1: #161d2b;
+  --surface-2: #1e2637;
+  --surface-3: #27314553;
+  --border: #2b3547;
+  --border-strong: #3a465e;
+
+  /* ink */
+  --text-1: #e6edf7;
+  --text-2: #a9b6cd;
+  --text-3: #8593ad;
+
+  /* brand */
+  --accent: #4fd1c5;
+  --accent-ink: #0e1421;
+  --accent-wash: rgba(79, 209, 197, 0.12);
+  --accent-line: rgba(79, 209, 197, 0.45);
+
+  /* status (reserved — icon + label always accompany these) */
+  --good: #0ca30c;
+  --good-wash: rgba(12, 163, 12, 0.14);
+  --warning: #fab219;
+  --warning-wash: rgba(250, 178, 25, 0.14);
+  --serious: #ec835a;
+  --serious-wash: rgba(236, 131, 90, 0.14);
+  --critical: #d03b3b;
+  --critical-wash: rgba(208, 59, 59, 0.16);
+
+  /* chart */
+  --series-1: #4fd1c5;
+  --chart-track: #1e2637;
+  --gridline: #27314b;
+
+  /* type scale */
+  --step--1: 0.8125rem;
+  --step-0: 0.9375rem;
+  --step-1: 1.0625rem;
+  --step-2: 1.375rem;
+  --step-3: 1.75rem;
+  --hero: 2.75rem;
+
+  /* space — multiples of 4 */
+  --sp-1: 0.25rem;
+  --sp-2: 0.5rem;
+  --sp-3: 0.75rem;
+  --sp-4: 1rem;
+  --sp-5: 1.5rem;
+  --sp-6: 2rem;
+  --sp-7: 3rem;
+
+  /* shape */
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 14px;
+  --r-pill: 999px;
+
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow-2: 0 8px 28px rgba(0, 0, 0, 0.45);
+
+  --font: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, 'Cascadia Mono', Consolas, monospace;
+}
+
+/* Light theme: the OS preference, unless the viewer explicitly stamped dark. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme='dark']) {
+    color-scheme: light;
+
+    --page: #f4f6fa;
+    --surface-1: #ffffff;
+    --surface-2: #f7f9fc;
+    --surface-3: #eef2f8;
+    --border: #dde3ed;
+    --border-strong: #c3ccdb;
+
+    --text-1: #111827;
+    --text-2: #4b5565;
+    --text-3: #6b7280;
+
+    --accent: #0f8b80;
+    --accent-ink: #ffffff;
+    --accent-wash: rgba(15, 139, 128, 0.1);
+    --accent-line: rgba(15, 139, 128, 0.4);
+
+    --good-wash: rgba(12, 163, 12, 0.12);
+    --warning-wash: rgba(250, 178, 25, 0.18);
+    --serious-wash: rgba(236, 131, 90, 0.18);
+    --critical-wash: rgba(208, 59, 59, 0.12);
+
+    --series-1: #0f8b80;
+    --chart-track: #eef2f8;
+    --gridline: #e4e9f1;
+
+    --shadow-1: 0 1px 2px rgba(17, 24, 39, 0.06);
+    --shadow-2: 0 8px 28px rgba(17, 24, 39, 0.12);
+  }
+}
+
+/* The toggle wins in both directions. */
+:root[data-theme='light'] {
+  color-scheme: light;
+
+  --page: #f4f6fa;
+  --surface-1: #ffffff;
+  --surface-2: #f7f9fc;
+  --surface-3: #eef2f8;
+  --border: #dde3ed;
+  --border-strong: #c3ccdb;
+
+  --text-1: #111827;
+  --text-2: #4b5565;
+  --text-3: #6b7280;
+
+  --accent: #0f8b80;
+  --accent-ink: #ffffff;
+  --accent-wash: rgba(15, 139, 128, 0.1);
+  --accent-line: rgba(15, 139, 128, 0.4);
+
+  --good-wash: rgba(12, 163, 12, 0.12);
+  --warning-wash: rgba(250, 178, 25, 0.18);
+  --serious-wash: rgba(236, 131, 90, 0.18);
+  --critical-wash: rgba(208, 59, 59, 0.12);
+
+  --series-1: #0f8b80;
+  --chart-track: #eef2f8;
+  --gridline: #e4e9f1;
+
+  --shadow-1: 0 1px 2px rgba(17, 24, 39, 0.06);
+  --shadow-2: 0 8px 28px rgba(17, 24, 39, 0.12);
+}

@@ -8,8 +8,10 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/taskflow-api ./cmd/api
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata curl
 WORKDIR /app
 COPY --from=builder /out/taskflow-api /app/taskflow-api
 EXPOSE 8080
+HEALTHCHECK --interval=10s --timeout=3s --retries=5 \
+  CMD curl -f http://localhost:8080/api/v1/health || exit 1
 CMD ["/app/taskflow-api"]

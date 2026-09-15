@@ -8,7 +8,13 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/taskflow-worker ./cmd/worker
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates tzdata
+# The only OCR runtime dependency is tesseract (Apache-2.0), for images and for
+# scanned PDFs. PDF handling itself is pure Go — pdfcpu (Apache-2.0) and
+# ledongthuc/pdf (BSD-3) — so poppler, and its GPL-2 obligations, are gone.
+# Portuguese is not optional: the documents this is built for are Brazilian, and
+# without the por model tesseract mangles every accented word (the desktop build
+# already ships por+eng). German stays for the Steuer-ID detector.
+RUN apk add --no-cache ca-certificates tzdata tesseract-ocr tesseract-ocr-data-eng tesseract-ocr-data-por tesseract-ocr-data-deu
 WORKDIR /app
 COPY --from=builder /out/taskflow-worker /app/taskflow-worker
 CMD ["/app/taskflow-worker"]
