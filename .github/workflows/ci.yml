@@ -63,10 +63,12 @@ jobs:
           go-version: "1.25"
           cache: true
 
-      - name: Install PostgreSQL client (psql)
+      # tesseract: the scanned-PDF pipeline test fails without it, by design
+      # (a skipped integration test reports "ok" for coverage that never ran).
+      - name: Install PostgreSQL client (psql) and tesseract
         run: |
           sudo apt-get update
-          sudo apt-get install -y postgresql-client
+          sudo apt-get install -y postgresql-client tesseract-ocr
 
       - name: Wait for Postgres
         run: |
