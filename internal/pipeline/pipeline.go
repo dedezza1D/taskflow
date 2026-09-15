@@ -106,10 +106,11 @@ func (p *Pipeline) Handle(ctx context.Context, task *store.Task) error {
 
 	doc, err := p.st.GetDocument(ctx, docID)
 	if errors.Is(err, store.ErrNotFound) {
-		// Erased after enqueue (C4 tombstone): the row is gone, so this message
-		// is a no-op. Ack by returning nil.
+		// Erased after enqueue (C4): the row is gone, so this message is a
+		// no-op. Ack only once nothing is left under the prefix — an earlier
+		// attempt may have raced the erasure and written behind it.
 		p.logger.Info("document not found (erased); acking", zap.String("document_id", pl.DocumentID))
-		return nil
+		return p.purgeErased(ctx, docID)
 	}
 	if err != nil {
 		return fmt.Errorf("load document: %w", err)
@@ -117,7 +118,9 @@ func (p *Pipeline) Handle(ctx context.Context, task *store.Task) error {
 
 	switch doc.Status {
 	case store.DocErased:
-		return nil // tombstoned mid-erasure: never touch its bytes again
+		// Tombstoned mid-erasure: never write its bytes again, and make sure
+		// none survive.
+		return p.purgeErased(ctx, docID)
 	case store.DocCompleted:
 		return nil // duplicate delivery after completion
 	}
@@ -129,18 +132,18 @@ func (p *Pipeline) Handle(ctx context.Context, task *store.Task) error {
 	// Stage 1 — OCR (checkpointed; resumes here after a mid-OCR crash).
 	text, err := p.runOCR(ctx, doc)
 	if err != nil {
-		return stageErr(StageOCR, err)
+		return stageOutcome(StageOCR, err)
 	}
 
 	// Stage 2 — PII detection (findings carry category+location, never values).
 	findings, err := p.runPII(ctx, doc, text)
 	if err != nil {
-		return stageErr(StagePII, err)
+		return stageOutcome(StagePII, err)
 	}
 
 	// Stage 3 — compliance report.
 	if err := p.runReport(ctx, doc, findings); err != nil {
-		return stageErr(StageReport, err)
+		return stageOutcome(StageReport, err)
 	}
 
 	p.setStatus(ctx, docID, store.DocCompleted, nil)
@@ -218,6 +221,34 @@ func stageErr(stage string, err error) error {
 	return fmt.Errorf("stage %s: %w", stage, err)
 }
 
+// stageOutcome is stageErr, except that an erasure detected by the fence is a
+// clean ack rather than a failure: the bytes are already gone, and retrying
+// would only record a failed execution for a document that no longer exists.
+func stageOutcome(stage string, err error) error {
+	if errors.Is(err, errDocumentErased) {
+		return nil
+	}
+	return stageErr(stage, err)
+}
+
+// errDocumentErased reports that the document was erased while a stage was
+// computing, and that whatever the stage wrote has been purged.
+var errDocumentErased = errors.New("document erased during processing")
+
+// purgeErased removes every object under an erased document's prefix. The
+// erasure handler already did this once; running it again is what catches a
+// write that landed after it (see saveCheckpoint). Idempotent. A failure is
+// returned, not swallowed, so the message is retried rather than acked while
+// bytes remain.
+func (p *Pipeline) purgeErased(ctx context.Context, docID uuid.UUID) error {
+	if err := p.objects.RemovePrefix(ctx, "documents/"+docID.String()); err != nil {
+		p.logger.Error("erasure fence: purge failed",
+			zap.String("document_id", docID.String()), zap.Error(err))
+		return fmt.Errorf("purge erased document: %w", err)
+	}
+	return nil
+}
+
 // ---- checkpoint plumbing -----------------------------------------------
 
 // loadCheckpoint returns the artifact bytes if the stage already completed.
@@ -253,13 +284,50 @@ func (p *Pipeline) loadCheckpoint(ctx context.Context, docID uuid.UUID, stage, k
 // saveCheckpoint writes the stage artifact atomically, then records the row.
 // Order matters: object first (atomic visibility), row second, so the row's
 // existence is the completion signal.
+//
+// It is also the ERASURE FENCE. Handle checks for a tombstone only when it
+// starts, and a stage can run for minutes (the OCR ceiling) after that. If C4
+// erases the document in that window, its RemovePrefix runs before this Put,
+// and the artifact — for OCR, the document's full text — would land in a
+// directory no row points to any more, where neither erasure nor the retention
+// sweep (both of which enumerate rows) would ever find it.
+//
+// So after writing, the document is re-read. The two orders cannot both miss:
+// the erasure tombstones BEFORE it removes bytes, and this reads AFTER it
+// writes them. Either the read sees the tombstone (or the missing row) and
+// purges here, or the tombstone came later — and then so did the erasure's
+// RemovePrefix, which takes this object with it.
 func (p *Pipeline) saveCheckpoint(ctx context.Context, docID uuid.UUID, stage, kind, key string, data []byte) error {
 	uri, err := p.objects.Put(ctx, key, bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("write %s artifact: %w", stage, err)
 	}
-	if _, err := p.st.CreateArtifact(ctx, docID, stage, kind, uri); err != nil {
-		return fmt.Errorf("record %s artifact: %w", stage, err)
+	// Not returned yet: once the row is gone this fails on its foreign key, and
+	// the fence below has to run first to tell that apart from a real failure.
+	_, recordErr := p.st.CreateArtifact(ctx, docID, stage, kind, uri)
+
+	doc, err := p.st.GetDocument(ctx, docID)
+	switch {
+	case errors.Is(err, store.ErrNotFound) || (err == nil && doc.Status == store.DocErased):
+		if err := p.purgeErased(ctx, docID); err != nil {
+			return err
+		}
+		p.logger.Info("erasure fence: document erased mid-stage; artifact purged",
+			zap.String("document_id", docID.String()), zap.String("stage", stage))
+		return errDocumentErased
+	case err != nil:
+		// Cannot tell whether an erasure happened. Keep nothing we cannot account
+		// for: drop the object and retry. A row left pointing at it is harmless —
+		// loadCheckpoint recomputes a stage whose object is missing.
+		if rmErr := p.objects.Remove(ctx, uri); rmErr != nil {
+			p.logger.Error("erasure fence: could not drop unverified artifact",
+				zap.String("document_id", docID.String()), zap.String("stage", stage), zap.Error(rmErr))
+		}
+		return fmt.Errorf("verify document after %s write: %w", stage, err)
+	}
+
+	if recordErr != nil {
+		return fmt.Errorf("record %s artifact: %w", stage, recordErr)
 	}
 	return nil
 }
