@@ -8,22 +8,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dedezza1D/taskflow/internal/auth"
 	"github.com/dedezza1D/taskflow/internal/store"
 	"go.uber.org/zap"
 )
 
 func TestExecutionsAPI_EmptyList(t *testing.T) {
-	dsn := "postgres://taskflow:taskflow@localhost:5432/taskflow?sslmode=disable"
-	st, err := store.New(context.Background(), dsn)
-	if err != nil {
-		t.Fatalf("store.New: %v", err)
-	}
+	st := mustStore(t)
 	defer st.Close()
 
 	created, err := st.CreateTask(context.Background(), store.CreateTaskParams{
 		Type:     "demo",
 		Payload:  []byte(`{"x":1}`),
 		Priority: store.PriorityNormal,
+		// Auth is off in this server, so requests run as the local principal —
+		// and only that tenant's tasks are visible to it.
+		OrgID: auth.LocalOrgID,
 	})
 	if err != nil {
 		t.Fatalf("CreateTask: %v", err)

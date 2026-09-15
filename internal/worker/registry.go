@@ -51,10 +51,15 @@ func IsPermanent(err error) bool {
 func DefaultHandlers() *Registry {
 	r := NewRegistry()
 
-	// demo: succeed after 200ms
+	// demo: succeed after 200ms. Respects ctx cancellation so the lease ceiling
+	// is self-enforcing — the convention every real stage handler must follow.
 	r.Register("demo", func(ctx context.Context, task *store.Task) error {
-		time.Sleep(200 * time.Millisecond)
-		return nil
+		select {
+		case <-time.After(200 * time.Millisecond):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	})
 
 	// fail: permanent failure (never retry)

@@ -1,12 +1,19 @@
 services:
   nginx:
-    image: nginx:1.27-alpine
+    build:
+      context: .
+      dockerfile: Dockerfile.web
     restart: unless-stopped
     depends_on: [api, grafana]
     ports:
       - "80:80"
+      - "443:443"
     volumes:
       - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # Production certificates are mounted from outside the repository. Where
+      # they come from — ACME/Let's Encrypt, or a corporate CA — is a deployment
+      # decision; nginx only needs cert.pem and key.pem at this path.
+      - ${TLS_CERT_DIR:-./deploy/nginx/certs}:/etc/nginx/tls:ro
     networks: [taskflow]
 
   postgres:
@@ -62,8 +69,20 @@ services:
       DATABASE_URL: "postgres://taskflow:taskflow@postgres:5432/taskflow?sslmode=disable"
       NATS_URL: "nats://nats:4222"
       NATS_STREAM_NAME: "TASKFLOW"
+      # The API writes each original here and the worker reads it back, so both
+      # must mount the same volume at the same path. Left to the relative
+      # default, each container gets a private directory: uploads return 201
+      # and every document then dead-letters at OCR. config.Validate() refuses
+      # a relative path with ENV=prod for exactly that reason.
+      OBJECTS_DIR: "/data/objects"
+      # ENV=prod also makes config.Validate() refuse AUTH_ENABLED=false.
+      AUTH_ENABLED: "true"
+      SECURE_COOKIES: "true"
+      SESSION_TTL: "12h"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
       OTEL_SERVICE_NAME: "taskflow-api"
+    volumes:
+      - objects_data:/data/objects
     depends_on: [postgres, nats]
     networks: [taskflow]
 
@@ -81,8 +100,20 @@ services:
       NATS_CONSUMER_NAME: "taskflow-worker"
       WORKER_CONCURRENCY: "20"
       WORKER_METRICS_PORT: "9091"
+      # Same volume, same path as the API — see the note there.
+      OBJECTS_DIR: "/data/objects"
+      # The worker sets no cookies, but it runs the same config.Validate() as
+      # the API, and ENV=prod refuses SECURE_COOKIES=false. Without this line the
+      # worker panics at startup and restarts forever: uploads are accepted and
+      # nothing is ever processed.
+      SECURE_COOKIES: "true"
+      # Without this the default is English only, and every accented word in a
+      # Brazilian scan is mangled. The image ships por, eng and deu.
+      OCR_LANGS: "por+eng"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
       OTEL_SERVICE_NAME: "taskflow-worker"
+    volumes:
+      - objects_data:/data/objects
     depends_on: [postgres, nats]
     networks: [taskflow]
 
@@ -99,6 +130,18 @@ services:
     environment:
       GF_SERVER_ROOT_URL: "%(protocol)s://%(domain)s/grafana/"
       GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      # nginx publishes Grafana at /grafana/ on the same public origin as the
+      # app, and its Loki datasource holds the services' logs. Grafana's stock
+      # admin:admin must never be the credential guarding that, so compose
+      # refuses to start until an operator chooses one.
+      #
+      # Grafana reads this only when it first creates its database. On a
+      # grafana_data volume that already exists, set it with:
+      #   docker compose -f docker-compose.prod.yml exec grafana \
+      #     grafana cli admin reset-admin-password '<new password>'
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD - Grafana is served publicly at /grafana/}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
     volumes:
       - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
@@ -144,6 +187,7 @@ volumes:
   grafana_data:
   loki_data:
   tempo_data:
+  objects_data:
 
 networks:
   taskflow:

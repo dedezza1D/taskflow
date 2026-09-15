@@ -3,28 +3,35 @@ package store
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 )
 
 type CreateTaskParams struct {
 	Type     string
 	Payload  []byte // JSON
 	Priority TaskPriority
+	// OrgID is the tenant that owns the task. There is no fallback: the column
+	// is NOT NULL with a foreign key, so a caller that forgets it fails loudly.
+	OrgID uuid.UUID
 }
 
 func (s *Store) CreateTask(ctx context.Context, p CreateTaskParams) (*Task, error) {
 	id := uuid.New()
 
 	q := `
-INSERT INTO tasks (id, type, payload, priority, status)
-VALUES ($1, $2, $3::jsonb, $4, 'queued')
+INSERT INTO tasks (id, type, payload, priority, status, org_id)
+VALUES ($1, $2, $3, $4, 'queued', $5)
 RETURNING id, type, payload, priority, status, created_at, updated_at, version;
 `
 
+	// The payload goes over as a string, not []byte. Postgres then resolves the
+	// parameter against the jsonb column (a []byte would arrive as bytea and be
+	// rejected), and SQLite stores it as TEXT — so one statement serves both
+	// without a dialect-specific cast.
 	var t Task
-	err := s.db.QueryRow(ctx, q, id, p.Type, p.Payload, string(p.Priority)).Scan(
+	err := s.db.QueryRow(ctx, q, id, p.Type, string(p.Payload), string(p.Priority), p.OrgID).Scan(
 		&t.ID, &t.Type, &t.Payload, &t.Priority, &t.Status, &t.CreatedAt, &t.UpdatedAt, &t.Version,
 	)
 	if err != nil {
@@ -33,17 +40,35 @@ RETURNING id, type, payload, priority, status, created_at, updated_at, version;
 	return &t, nil
 }
 
+// GetTask is the engine's read: workers and the reconciler act on any tenant's
+// task. Request paths must use GetTaskForOrg.
 func (s *Store) GetTask(ctx context.Context, id uuid.UUID) (*Task, error) {
 	q := `
 SELECT id, type, payload, priority, status, created_at, updated_at, version
 FROM tasks
 WHERE id = $1;
 `
+	return scanTask(s.db.QueryRow(ctx, q, id))
+}
+
+// GetTaskForOrg is the request-path read. Like GetDocumentForOrg, another
+// tenant's task is ErrNotFound rather than forbidden, so an id probe cannot
+// confirm that it exists elsewhere.
+func (s *Store) GetTaskForOrg(ctx context.Context, id, orgID uuid.UUID) (*Task, error) {
+	q := `
+SELECT id, type, payload, priority, status, created_at, updated_at, version
+FROM tasks
+WHERE id = $1 AND org_id = $2;
+`
+	return scanTask(s.db.QueryRow(ctx, q, id, orgID))
+}
+
+func scanTask(row Row) (*Task, error) {
 	var t Task
-	err := s.db.QueryRow(ctx, q, id).Scan(
+	err := row.Scan(
 		&t.ID, &t.Type, &t.Payload, &t.Priority, &t.Status, &t.CreatedAt, &t.UpdatedAt, &t.Version,
 	)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
@@ -59,7 +84,19 @@ type ListTasksParams struct {
 	Offset int
 }
 
+// ListTasks lists across every tenant. It exists for the engine — the local
+// queue claims queued work with it — and must never back a request path; use
+// ListTasksForOrg there.
 func (s *Store) ListTasks(ctx context.Context, p ListTasksParams) ([]Task, error) {
+	return s.listTasks(ctx, p, nil)
+}
+
+// ListTasksForOrg is ListTasks scoped to one tenant.
+func (s *Store) ListTasksForOrg(ctx context.Context, orgID uuid.UUID, p ListTasksParams) ([]Task, error) {
+	return s.listTasks(ctx, p, &orgID)
+}
+
+func (s *Store) listTasks(ctx context.Context, p ListTasksParams, orgID *uuid.UUID) ([]Task, error) {
 	limit := p.Limit
 	if limit <= 0 || limit > 200 {
 		limit = 50
@@ -70,23 +107,72 @@ func (s *Store) ListTasks(ctx context.Context, p ListTasksParams) ([]Task, error
 		offset = 0
 	}
 
-	// simple filter building (safe parameterization)
-	q := `
-SELECT id, type, payload, priority, status, created_at, updated_at, version
-FROM tasks
-WHERE ($1::text IS NULL OR status = $1)
-  AND ($2::text IS NULL OR type = $2)
-ORDER BY created_at DESC
-LIMIT $3 OFFSET $4;
-`
-
 	var status *string
 	if p.Status != nil {
 		sv := string(*p.Status)
 		status = &sv
 	}
+	args := []any{status, p.Type, limit, offset}
 
-	rows, err := s.db.Query(ctx, q, status, p.Type, limit, offset)
+	// The tenant clause is appended rather than made optional in SQL: org_id is
+	// a UUID on PostgreSQL, so the CAST(... AS TEXT) IS NULL trick used for the
+	// other filters would compare uuid to text and fail the statement.
+	tenant := ""
+	if orgID != nil {
+		tenant = "\n  AND org_id = $5"
+		args = append(args, *orgID)
+	}
+
+	q := `
+SELECT id, type, payload, priority, status, created_at, updated_at, version
+FROM tasks
+-- CAST rather than $1::text: the same statement runs on SQLite, which has no
+-- :: operator. A bare "$1 IS NULL" leaves PostgreSQL unable to infer the
+-- parameter type and it fails the statement with 42P08.
+WHERE (CAST($1 AS TEXT) IS NULL OR status = CAST($1 AS TEXT))
+  AND (CAST($2 AS TEXT) IS NULL OR type = CAST($2 AS TEXT))` + tenant + `
+ORDER BY created_at DESC
+LIMIT $3 OFFSET $4;
+`
+
+	rows, err := s.db.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]Task, 0, limit)
+	for rows.Next() {
+		var t Task
+		if err := rows.Scan(&t.ID, &t.Type, &t.Payload, &t.Priority, &t.Status, &t.CreatedAt, &t.UpdatedAt, &t.Version); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ListStaleTasks returns tasks stuck in a non-terminal state whose updated_at is
+// older than cutoff — candidates for reconciliation: a 'queued' task whose enqueue
+// was lost, or a 'processing' task left behind by a crashed worker. Ordered oldest
+// first so the most-stuck are handled before the per-pass limit is reached.
+func (s *Store) ListStaleTasks(ctx context.Context, cutoff time.Time, limit int) ([]Task, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+
+	q := `
+SELECT id, type, payload, priority, status, created_at, updated_at, version
+FROM tasks
+WHERE status IN ('queued', 'processing')
+  AND updated_at < $1
+ORDER BY updated_at ASC
+LIMIT $2;
+`
+	rows, err := s.db.Query(ctx, q, cutoff, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +206,7 @@ RETURNING id, type, payload, priority, status, created_at, updated_at, version;
 	err := s.db.QueryRow(ctx, q, id, expectedVersion, string(newStatus)).Scan(
 		&t.ID, &t.Type, &t.Payload, &t.Priority, &t.Status, &t.CreatedAt, &t.UpdatedAt, &t.Version,
 	)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, ErrNoRows) {
 		// either not found OR version mismatch; check existence
 		_, getErr := s.GetTask(ctx, id)
 		if getErr == ErrNotFound {

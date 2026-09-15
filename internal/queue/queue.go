@@ -16,6 +16,20 @@ const (
 	SubjectDLQ    = "tasks.dlq"
 )
 
+// SubjectForPriority maps a task priority to its stream subject, defaulting to
+// normal for unknown/empty values. Shared by the API publisher and the reconciler
+// so they always route a given priority to the same subject.
+func SubjectForPriority(priority string) string {
+	switch priority {
+	case "high":
+		return SubjectHigh
+	case "low":
+		return SubjectLow
+	default:
+		return SubjectNormal
+	}
+}
+
 type Config struct {
 	NATSURL      string
 	StreamName   string
