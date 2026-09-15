@@ -340,9 +340,10 @@ type eraseDocumentResponse struct {
 // handleDeleteDocument is C4 — right to erasure (GDPR Art. 17). The order is
 // deliberate:
 //
-//  1. TOMBSTONE the row (status=erased, optimistic): from this instant any
-//     worker holding an in-flight message re-reads a terminal status and acks
-//     without touching the bytes.
+//  1. TOMBSTONE the row (status=erased, optimistic): from this instant a
+//     worker picking up the message acks without touching the bytes, and a
+//     worker already mid-stage purges whatever it writes next — the fence in
+//     pipeline.saveCheckpoint, which is what keeps step 2 from being outrun.
 //  2. Remove every object under documents/{id}/ — original and all stage
 //     artifacts (the prefix is the enumerable byte-side inventory).
 //  3. Delete the task row (executions cascade). A later redelivery of its
