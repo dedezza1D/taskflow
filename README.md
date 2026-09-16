@@ -210,6 +210,14 @@ endpoint cannot be used to flood someone's inbox.
 In dev, `docker compose` runs **Mailpit** as a local catcher: nothing leaves the
 machine, and the mail appears at `http://localhost:8025`.
 
+**Sign-in is throttled.** Five attempts per address in fifteen minutes, then
+`429` with `Retry-After` — even for the right password, which would otherwise
+reveal the correct guess. Known and unknown addresses are counted identically,
+so the limit is not a directory of accounts; a successful sign-in clears the
+count. The limit lives in each API process; nginx adds a per-IP limit on the
+sign-in and recovery endpoints for one address spraying many accounts. Typed
+addresses are never logged.
+
 - `POST /api/v1/auth/login` — sets an `HttpOnly; SameSite=Lax` session cookie
 - `POST /api/v1/auth/logout` — deletes the session row, so a copied token dies too
 - `GET /api/v1/auth/me` — who am I (and whether this build has auth at all)

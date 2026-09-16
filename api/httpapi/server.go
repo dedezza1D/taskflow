@@ -28,6 +28,7 @@ type Server struct {
 	mailer         mail.Sender
 	baseURL        string
 	resetTTL       time.Duration
+	loginLimiter   *loginLimiter
 }
 
 type Config struct {
@@ -102,6 +103,7 @@ func NewServer(cfg Config, logger *zap.Logger, st *store.Store, q *queue.Queue) 
 		mailer:         cfg.Mailer,
 		baseURL:        cfg.BaseURL,
 		resetTTL:       resetTTL,
+		loginLimiter:   newLoginLimiter(),
 	}
 
 	// Resolves the caller for every request; rejection is per-route below.

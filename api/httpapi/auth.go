@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/dedezza1D/taskflow/internal/auth"
@@ -130,6 +131,17 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	email := auth.NormalizeEmail(req.Email)
+
+	// Before the lookup, so a throttled attempt reveals nothing — not even
+	// through timing — about whether the account exists. See login_throttle.go.
+	if ok, retryAfter := s.loginLimiter.reserve(email); !ok {
+		s.logger.Info("login throttled")
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Round(time.Second).Seconds())))
+		writeErr(w, http.StatusTooManyRequests, "too_many_attempts",
+			"too many sign-in attempts for this account; try again later")
+		return
+	}
+
 	user, err := s.store.GetUserByEmail(r.Context(), email)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		s.logger.Error("login lookup failed", zap.Error(err))
@@ -138,16 +150,23 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Always run a comparison, so an unknown address costs the same as a wrong
-	// password. The credentials are never logged, at any level.
+	// password. Neither the credentials nor the typed address are logged: the
+	// address is personal data, and on a rejection it is whatever the caller
+	// chose to type.
 	hash := dummyHash
 	if user != nil {
 		hash = user.PasswordHash
 	}
 	if !auth.VerifyPassword(hash, req.Password) || user == nil {
-		s.logger.Info("login rejected", zap.String("email", email))
+		if user != nil {
+			s.logger.Info("login rejected", zap.String("user_id", user.ID.String()))
+		} else {
+			s.logger.Info("login rejected: no such account")
+		}
 		writeErr(w, http.StatusUnauthorized, "invalid_credentials", "email or password is incorrect")
 		return
 	}
+	s.loginLimiter.reset(email)
 
 	token, tokenHash, err := auth.NewSessionToken()
 	if err != nil {

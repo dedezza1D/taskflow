@@ -7,6 +7,8 @@ import { ApiError } from '../api'
 
 const BY_CODE: Record<string, string> = {
   invalid_credentials: 'E-mail ou senha incorretos.',
+  too_many_attempts:
+    'Muitas tentativas de entrar. Aguarde alguns minutos e tente de novo.',
   unauthenticated: 'Sua sessão expirou. Entre novamente.',
   forbidden: 'Seu papel não permite esta ação.',
   email_taken: 'Já existe uma conta com este e-mail.',
@@ -66,6 +68,8 @@ export function describeError(e: unknown, fallback: string): string {
     return 'Dados inválidos. Revise o formulário.'
   }
   if (BY_CODE[e.code]) return BY_CODE[e.code]
+  // nginx's per-IP limit answers 429 with its own page, so there is no code.
+  if (e.status === 429) return BY_CODE.too_many_attempts
   if (e.status >= 502 && e.status <= 504) {
     return 'O servidor não respondeu. Tente de novo em instantes.'
   }

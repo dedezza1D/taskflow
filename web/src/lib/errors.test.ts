@@ -42,6 +42,18 @@ describe('describeError', () => {
     expect(describeError(e, 'x')).not.toContain('rule')
   })
 
+  it('asks the user to wait when sign-in is throttled, by API or nginx', () => {
+    const api = new ApiError(
+      429,
+      'too_many_attempts',
+      'too many sign-in attempts',
+    )
+    const edge = new ApiError(429, 'http_error', 'Too Many Requests')
+
+    expect(describeError(api, 'x')).toContain('Muitas tentativas')
+    expect(describeError(edge, 'x')).toContain('Muitas tentativas')
+  })
+
   it('says the server did not answer for gateway errors', () => {
     expect(
       describeError(new ApiError(502, 'http_error', 'Bad Gateway'), 'x'),
