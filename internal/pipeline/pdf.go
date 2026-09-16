@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -44,6 +45,12 @@ import (
 // a watermark — so a nonzero result is not by itself proof. Set low enough that
 // a sparse but genuine page still qualifies.
 const minTextLayerChars = 24
+
+// gapRatio is how much horizontal space between two text runs counts as a word
+// break rather than kerning, as a fraction of the font size. A fifth of an em is
+// wider than the kerning in the documents tested here and narrower than a real
+// space, so a value split across runs stays whole while two columns come apart.
+const gapRatio = 0.2
 
 // pdfText turns a PDF into text, preferring its text layer and falling back to
 // OCR over the images it contains.
@@ -141,27 +148,10 @@ func pdfTextLayer(path string) (string, bool) {
 		if page.V.IsNull() {
 			continue
 		}
-		// By ROW, not GetPlainText. GetPlainText concatenates the page's text
-		// objects with nothing between them, so the last value on a line is
-		// glued to the first word of the next: "...529.982.247-25E-mail:".
-		// Every detector here ends on a word boundary, and that boundary is
-		// gone, so a CPF, CNPJ, card or IBAN sitting at the end of a line went
-		// undetected — on PDFs with a text layer, which is most of them. The
-		// document looked clean because the text was unreadable to the
-		// detectors, which is the worst way for this tool to be wrong.
-		rows, err := page.GetTextByRow()
-		if err != nil {
-			return "", false
-		}
 		if i > 1 {
 			sb.WriteByte('\f') // page separator, same convention as pdftotext
 		}
-		for _, row := range rows {
-			for _, word := range row.Content {
-				sb.WriteString(word.S)
-			}
-			sb.WriteByte('\n')
-		}
+		sb.WriteString(layoutPage(page.Content().Text))
 	}
 
 	out := sb.String()
@@ -172,6 +162,76 @@ func pdfTextLayer(path string) (string, bool) {
 		return out, false
 	}
 	return out, true
+}
+
+// layoutPage turns a page's glyphs back into lines.
+//
+// The reader offers two ready-made answers and neither is usable here.
+// GetPlainText concatenates the page's text objects with nothing between them,
+// so the last value on a line is glued to the first word of the next:
+// "...529.982.247-25E-mail:". Every detector ends on a word boundary, and that
+// boundary is gone, so a CPF, CNPJ, card or IBAN at the end of a line went
+// undetected — silently, on PDFs with a text layer, which is most of them.
+// GetTextByRow groups by line but reports neither width nor font size, so the
+// same glue reappears wherever a line is drawn as several runs — which is how
+// two columns arrive.
+//
+// So the glyphs are laid out here, from the only source that carries position
+// AND advance width: a new line when the baseline moves, a space when the gap
+// to the next glyph is wider than kerning.
+func layoutPage(chars []pdf.Text) string {
+	if len(chars) == 0 {
+		return ""
+	}
+
+	// Reading order: top line first, then left to right. Glyphs arrive in
+	// drawing order, which is not required to be either.
+	ordered := make([]pdf.Text, len(chars))
+	copy(ordered, chars)
+	sort.SliceStable(ordered, func(a, b int) bool {
+		x, y := ordered[a], ordered[b]
+		if math.Abs(x.Y-y.Y) > sameLineTolerance(x, y) {
+			return x.Y > y.Y
+		}
+		return x.X < y.X
+	})
+
+	var sb strings.Builder
+	var prev pdf.Text
+	for i, c := range ordered {
+		if i > 0 {
+			switch {
+			case math.Abs(c.Y-prev.Y) > sameLineTolerance(c, prev):
+				sb.WriteByte('\n')
+			case c.X-(prev.X+prev.W) > gapRatio*math.Max(c.FontSize, prev.FontSize):
+				// A gap wider than kerning is a word break the page drew
+				// without a space glyph: between columns, or around a value
+				// positioned on its own.
+				if !endsWithSpace(sb.String()) && !strings.HasPrefix(c.S, " ") {
+					sb.WriteByte(' ')
+				}
+			}
+		}
+		sb.WriteString(c.S)
+		prev = c
+	}
+	sb.WriteByte('\n')
+	return sb.String()
+}
+
+// sameLineTolerance is how far two baselines may differ and still count as one
+// line. Proportional to the text, because a superscript in 8pt type sits closer
+// to its baseline than one in 24pt does.
+func sameLineTolerance(a, b pdf.Text) float64 {
+	size := math.Max(a.FontSize, b.FontSize)
+	if size <= 0 {
+		size = 10 // no metrics reported: assume body text
+	}
+	return size * 0.3
+}
+
+func endsWithSpace(s string) bool {
+	return s != "" && (s[len(s)-1] == ' ' || s[len(s)-1] == '\n' || s[len(s)-1] == '\f')
 }
 
 // ocrEmbeddedImages pulls the pictures out of a scanned PDF and OCRs them.

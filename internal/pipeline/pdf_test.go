@@ -357,3 +357,119 @@ func TestPDFTextLayerKeepsLinesApart(t *testing.T) {
 		}
 	}
 }
+
+// helveticaWithWidths is the font the positioned fixture uses. Real documents
+// carry width metrics; without them the reader reports a run's width as zero
+// and the extractor cannot tell a column gap from the next glyph, which is
+// exactly the case writeRow refuses to guess about. 556/1000 em for every
+// character is close enough to Helvetica to make the arithmetic predictable.
+var helveticaWithWidths = func() string {
+	widths := make([]string, 0, 95)
+	for c := 32; c <= 126; c++ {
+		widths = append(widths, "556")
+	}
+	return "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 32 /LastChar 126 /Widths [" +
+		strings.Join(widths, " ") + "] >>"
+}()
+
+// pdfRun is one text run on a page: where it starts, and what it says.
+type pdfRun struct {
+	X, Y int
+	Text string
+}
+
+// buildPositionedPDF places runs at explicit coordinates, which is the only way
+// to reproduce a two-column layout — the case where two values share a line.
+func buildPositionedPDF(runs []pdfRun) []byte {
+	var buf bytes.Buffer
+	var offsets []int
+	addObj := func(body string) {
+		offsets = append(offsets, buf.Len())
+		fmt.Fprintf(&buf, "%d 0 obj\n%s\nendobj\n", len(offsets), body)
+	}
+
+	buf.WriteString("%PDF-1.4\n")
+
+	var content strings.Builder
+	content.WriteString("BT\n")
+	for _, r := range runs {
+		fmt.Fprintf(&content, "/F1 12 Tf 1 0 0 1 %d %d Tm (%s) Tj\n", r.X, r.Y, r.Text)
+	}
+	content.WriteString("ET\n")
+
+	addObj("<< /Type /Catalog /Pages 2 0 R >>")
+	addObj("<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+	addObj("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>")
+	addObj(fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", content.Len(), content.String()))
+	addObj(helveticaWithWidths)
+
+	xrefPos := buf.Len()
+	fmt.Fprintf(&buf, "xref\n0 %d\n0000000000 65535 f \n", len(offsets)+1)
+	for _, off := range offsets {
+		fmt.Fprintf(&buf, "%010d 00000 n \n", off)
+	}
+	fmt.Fprintf(&buf, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(offsets)+1, xrefPos)
+	return buf.Bytes()
+}
+
+// Two columns on the same line arrive as two runs with a gap between them and
+// no space glyph, so the end of the left column used to be glued to the start
+// of the right one — the same lost word boundary that hid values at the end of
+// a line, one axis over.
+func TestPDFTextLayerSeparatesColumns(t *testing.T) {
+	p := newPDFTestPipeline()
+
+	text, err := p.pdfText(context.Background(), buildPositionedPDF([]pdfRun{
+		{X: 72, Y: 700, Text: "CPF: 529.982.247-25"},
+		{X: 320, Y: 700, Text: "Cartao: 4111 1111 1111 1111"},
+		{X: 72, Y: 676, Text: "Documento de teste com duas colunas."},
+	}))
+	if err != nil {
+		t.Fatalf("pdfText: %v", err)
+	}
+
+	if strings.Contains(text, "25Cartao") {
+		t.Fatalf("columns were glued together: %q", text)
+	}
+
+	found := map[string]int{}
+	for _, f := range pii.Detect(text) {
+		found[f.Category]++
+	}
+	if found[pii.CategoryCPF] == 0 {
+		t.Errorf("the CPF ending the left column went undetected (found %v, text %q)", found, text)
+	}
+	if found[pii.CategoryCreditCard] == 0 {
+		t.Errorf("the card in the right column went undetected (found %v, text %q)", found, text)
+	}
+}
+
+// The gap rule must not fire on ordinary kerning: a value drawn as several
+// runs is still one value, and a space inside it would break the detector the
+// rule exists to feed.
+func TestPDFTextLayerKeepsAValueWhole(t *testing.T) {
+	p := newPDFTestPipeline()
+
+	// Adjacent runs: 12 characters at 556/1000 em of 12pt is 80pt, so the second
+	// run starts where the first ends - the next glyph, not a word break.
+	text, err := p.pdfText(context.Background(), buildPositionedPDF([]pdfRun{
+		{X: 72, Y: 700, Text: "CPF: 529.982"},
+		{X: 152, Y: 700, Text: ".247-25"},
+		{X: 72, Y: 676, Text: "Documento de teste com um valor partido."},
+	}))
+	if err != nil {
+		t.Fatalf("pdfText: %v", err)
+	}
+	if !strings.Contains(text, "529.982.247-25") {
+		t.Fatalf("a value split across runs came back broken: %q", text)
+	}
+	found := 0
+	for _, f := range pii.Detect(text) {
+		if f.Category == pii.CategoryCPF {
+			found++
+		}
+	}
+	if found == 0 {
+		t.Errorf("CPF split across two runs went undetected: %q", text)
+	}
+}
