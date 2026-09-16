@@ -8,3 +8,10 @@
 # flags every file, failing the CI gofmt gate. (.sh is worth adding too if the
 # smoke script ever ships CRLF.)
 *.go text eol=lf
+
+# Binaries: never line-ending-converted, never diffed as text. text=auto above
+# guesses, and a guess that says "text" corrupts the file on checkout.
+*.gif binary
+*.pdf binary
+*.png binary
+*.ico binary

@@ -1,0 +1,44 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 788 >>
+stream
+BT
+/F1 16 Tf 1 0 0 1 60 760 Tm (CONTRATO DE PRESTACAO DE SERVICOS) Tj
+/F1 12 Tf 1 0 0 1 60 720 Tm (Contratante: Maria Aparecida Ferreira da Silva) Tj
+/F1 12 Tf 1 0 0 1 60 700 Tm (CPF: 529.982.247-25) Tj
+/F1 12 Tf 1 0 0 1 60 680 Tm (E-mail: maria.ferreira@exemplo.com.br) Tj
+/F1 12 Tf 1 0 0 1 60 660 Tm (Telefone: 11 98765-4321) Tj
+/F1 12 Tf 1 0 0 1 60 620 Tm (Contratada: Northwind Servicos Digitais LTDA) Tj
+/F1 12 Tf 1 0 0 1 60 600 Tm (CNPJ: 11.222.333/0001-81) Tj
+/F1 12 Tf 1 0 0 1 60 560 Tm (Pagamento mensal no cartao final 1111) Tj
+/F1 12 Tf 1 0 0 1 60 540 Tm (Numero do cartao: 4111 1111 1111 1111) Tj
+/F1 12 Tf 1 0 0 1 60 520 Tm (Conta internacional IBAN: DE89 3704 0044 0532 0130 00) Tj
+/F1 10 Tf 1 0 0 1 60 470 Tm (Dados ficticios, gerados para demonstracao do TaskFlow.) Tj
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000001079 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+1176
+%%EOF
