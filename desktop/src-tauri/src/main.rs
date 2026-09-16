@@ -85,7 +85,12 @@ fn main() {
                             if !reported {
                                 if let Some(url) = text.trim().strip_prefix(READY_PREFIX) {
                                     reported = true;
+                                    // The URL carries the per-launch token that
+                                    // stands in for authentication, so it goes
+                                    // to the window and nowhere else.
                                     let _ = tx.send(Ok(url.trim().to_string()));
+                                    println!("{READY_PREFIX}(launch link handed to the window)");
+                                    continue;
                                 }
                             }
                             println!("{}", text.trim_end());

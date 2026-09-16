@@ -6,9 +6,11 @@
 // compliance tool this way — the scanner does not become another copy of the
 // personal data it finds.
 //
-// What that costs, deliberately: no authentication (there is nobody to
-// authenticate against on a single-user install; the OS login is the boundary)
-// and no TLS (loopback, and no certificate authority will vouch for localhost).
+// What that costs, deliberately: no user accounts (there is one user) and no
+// TLS (loopback, and no certificate authority will vouch for localhost). What
+// stands in for authentication is a per-launch token and a strict Host check —
+// loopback by itself is reachable from web pages and from other accounts on
+// the machine; see guard.go.
 // config.Validate refuses that combination whenever ENV=prod, so it cannot
 // escape onto a served deployment by accident.
 package main
@@ -153,8 +155,22 @@ func main() {
 	if err != nil {
 		logger.Fatal("listen failed", zap.String("addr", *addr), zap.Error(err))
 	}
+	if err := requireLoopback(ln.Addr()); err != nil {
+		logger.Fatal("unsafe listen address", zap.Error(err))
+	}
+
+	// Authentication is off, so loopback plus this guard is the whole access
+	// control — see guard.go for what loopback alone let through.
+	token, err := newLaunchToken()
+	if err != nil {
+		logger.Fatal("could not generate launch token", zap.Error(err))
+	}
+	handler = withLaunchGuard(handler, allowedHosts(ln.Addr()), token)
+
+	// The token goes to stdout only, which is the process that started us, and
+	// never into the log.
 	logger.Info("taskflow desktop ready", zap.String("url", "http://"+ln.Addr().String()))
-	fmt.Printf("TaskFlow Compliance is running at http://%s\n", ln.Addr().String())
+	fmt.Printf("TaskFlow Compliance is running at http://%s/?%s=%s\n", ln.Addr().String(), launchParam, token)
 
 	httpServer := &http.Server{
 		Handler:           handler,

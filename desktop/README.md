@@ -26,6 +26,19 @@ CORS, and the exact same frontend build the served deployment uses.
 
 Nothing listens outside loopback, and no document leaves the machine.
 
+### Loopback is not access control
+
+There are no user accounts, but loopback alone does not keep others out: any web
+page the user visits can reach `127.0.0.1` (and, through DNS rebinding, read the
+responses), and every account on a shared computer shares it. So the binary
+refuses non-loopback addresses, answers only requests whose `Host` is the
+loopback address it bound, and generates a random token at each launch. The URL
+it prints is `http://127.0.0.1:<port>/?launch=<token>`; opening it exchanges the
+token for an `HttpOnly`, `SameSite=Strict` cookie and redirects to a clean URL,
+and every request without that cookie gets a 401. Tauri hands the URL to the
+window and does not echo it. Running the binary by hand, open the printed URL
+as-is. The details are in `cmd/taskflow-desktop/guard.go`.
+
 ## The OCR engine travels with the app
 
 A scanned document needs OCR, and a user who just ran an installer has not

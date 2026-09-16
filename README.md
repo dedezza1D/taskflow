@@ -275,8 +275,9 @@ go build -o taskflow-desktop ./cmd/taskflow-desktop
 ./taskflow-desktop --web-dir web/dist
 ```
 
-It prints the URL it bound to (`--addr` defaults to `127.0.0.1:0`, letting the
-kernel pick a free port). Data lives under the per-user application directory
+It prints the URL to open, including a one-time launch token (`--addr` defaults
+to `127.0.0.1:0`, letting the kernel pick a free port; non-loopback addresses
+are refused). Data lives under the per-user application directory
 unless `--data-dir` says otherwise.
 
 ### Packaged as a native app
@@ -311,13 +312,20 @@ What it deliberately drops, and why:
 |---|---|---|
 | Database | PostgreSQL | SQLite file |
 | Queue | NATS JetStream | the `tasks` table + an in-process wake-up |
-| Auth | sessions, roles, tenants | none — one user, one machine |
+| Auth | sessions, roles, tenants | no accounts — a per-launch token and a strict `Host` check |
 | TLS | nginx terminates | none — loopback, and no CA vouches for localhost |
 
-Authentication and TLS are *server* concerns. On a single-user install there is
-nobody to authenticate against (the OS login is the boundary), so every request
-runs as a local admin principal. `config.Validate` refuses that combination
-whenever `ENV=prod`, so it cannot reach a served deployment by accident.
+User accounts and TLS are *server* concerns. On a single-user install there is
+nobody to sign in as, so every request runs as a local admin principal.
+`config.Validate` refuses that combination whenever `ENV=prod`, so it cannot
+reach a served deployment by accident.
+
+Loopback alone is not the boundary, though: web pages can reach `127.0.0.1`
+(DNS rebinding lets them read the answers), and so can every other account on
+the machine. The binary therefore listens only on loopback, rejects any `Host`
+but the address it bound, and requires a cookie obtained from the one-time
+launch link it prints — `http://127.0.0.1:<port>/?launch=<token>`. Open that
+URL as printed; see [desktop/README.md](desktop/README.md#loopback-is-not-access-control).
 
 The same store methods, pipeline, and worker loop run in both — the differences
 live behind two seams (`store.DB` and `queue.Broker`), not in forked code.
