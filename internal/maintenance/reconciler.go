@@ -51,36 +51,105 @@ func decideReconcile(priorAttempts, maxAttempts int) reconcileAction {
 // mark the document failed at its stage.
 type DeadLetterFunc func(ctx context.Context, t *store.Task, reason error)
 
-// RunReconciler runs a pass on a ticker until ctx is cancelled, starting with
-// one immediately: a process that restarts more often than the interval would
-// otherwise never rescue anything, which is every desktop run. It is safe
-// to run in every worker replica: each rescue is claimed with an optimistic-locked
-// status write before any publish, so concurrent sweeps single-flight down to one
-// republish/DLQ per task rather than amplifying with replica count.
-func RunReconciler(ctx context.Context, logger *zap.Logger, st *store.Store, q queue.Broker, cfg *config.Config, onDeadLetter DeadLetterFunc) {
-	ticker := time.NewTicker(cfg.WorkerReconcileInterval)
+// Reconciler rescues tasks the happy path lost track of. Two different failures,
+// swept separately because they need different clocks:
+//
+//   - A PUBLISH that never happened. Creating a task writes a row and then
+//     publishes a message, two systems with a crash window between them. Such a
+//     task is queued with enqueued_at NULL, and nothing can be holding it -
+//     there is no message to hold. It is republished within seconds.
+//   - A WORKER that died mid-flight, leaving the task 'processing' with its
+//     message gone. This one must wait out the processing ceiling, or the sweep
+//     would rescue work that is still legitimately running.
+//
+// Folding them into one sweep is what used to make a lost publish wait ten
+// minutes for a constraint that belongs to the other case.
+//
+// Safe in every replica: each rescue is claimed with an optimistic-locked status
+// write before any publish, so concurrent sweeps single-flight down to one
+// republish/DLQ per task instead of amplifying with replica count.
+type Reconciler struct {
+	Logger       *zap.Logger
+	Store        *store.Store
+	Broker       queue.Broker
+	Config       *config.Config
+	OnDeadLetter DeadLetterFunc
+
+	// RecoverUnpublished turns on the publish sweep. The desktop build leaves it
+	// off: there the tasks table IS the queue, publishing is a wake-up rather
+	// than a delivery, and every task would look unpublished forever.
+	RecoverUnpublished bool
+}
+
+// Run sweeps on a ticker until ctx is cancelled, starting with one pass
+// immediately: a process that restarts more often than the interval would
+// otherwise never rescue anything, which is every desktop run.
+func (rc *Reconciler) Run(ctx context.Context) {
+	ticker := time.NewTicker(rc.Config.WorkerReconcileInterval)
 	defer ticker.Stop()
 
-	logger.Info("reconciler started",
-		zap.Duration("interval", cfg.WorkerReconcileInterval),
-		zap.Duration("staleness", cfg.WorkerReconcileStaleness),
+	rc.Logger.Info("reconciler started",
+		zap.Duration("interval", rc.Config.WorkerReconcileInterval),
+		zap.Duration("staleness", rc.Config.WorkerReconcileStaleness),
+		zap.Bool("publish_recovery", rc.RecoverUnpublished),
 	)
 
-	if err := reconcileOnce(ctx, logger, st, q, cfg, onDeadLetter); err != nil {
-		logger.Warn("reconcile pass failed", zap.Error(err))
-	}
-
+	rc.sweep(ctx)
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Info("reconciler stopped")
+			rc.Logger.Info("reconciler stopped")
 			return
 		case <-ticker.C:
-			if err := reconcileOnce(ctx, logger, st, q, cfg, onDeadLetter); err != nil {
-				logger.Warn("reconcile pass failed", zap.Error(err))
-			}
+			rc.sweep(ctx)
 		}
 	}
+}
+
+func (rc *Reconciler) sweep(ctx context.Context) {
+	if rc.RecoverUnpublished {
+		if err := rc.recoverUnpublishedOnce(ctx); err != nil {
+			rc.Logger.Warn("publish recovery pass failed", zap.Error(err))
+		}
+	}
+	if err := reconcileOnce(ctx, rc.Logger, rc.Store, rc.Broker, rc.Config, rc.OnDeadLetter); err != nil {
+		rc.Logger.Warn("reconcile pass failed", zap.Error(err))
+	}
+}
+
+// recoverUnpublishedOnce republishes tasks that were committed but never
+// confirmed on the queue.
+//
+// The cutoff only has to clear the gap between INSERT and publish in a healthy
+// request, so it is seconds rather than minutes. Republishing one that was in
+// fact delivered is harmless: the worker claims optimistically and acks a task
+// it finds already terminal or in flight.
+func (rc *Reconciler) recoverUnpublishedOnce(ctx context.Context) error {
+	cutoff := time.Now().Add(-rc.Config.WorkerPublishRecoveryDelay)
+
+	pending, err := rc.Store.ListUnpublishedTasks(ctx, cutoff, 100)
+	if err != nil {
+		return err
+	}
+	for i := range pending {
+		t := &pending[i]
+		prior, err := rc.Store.MaxAttempt(ctx, t.ID)
+		if err != nil {
+			rc.Logger.Warn("publish recovery: max attempt lookup failed",
+				zap.String("task_id", t.ID.String()), zap.Error(err))
+			continue
+		}
+		// A task that never reached the queue cannot have exhausted its
+		// attempts, but the ledger decides either way — a crash-pill that was
+		// also never confirmed must dead-letter, not churn.
+		switch decideReconcile(prior, rc.Config.WorkerMaxAttempts) {
+		case reconcileDeadLetter:
+			reconcileDeadLetterTask(ctx, rc.Logger, rc.Store, rc.Broker, t, prior, rc.OnDeadLetter)
+		case reconcileRepublish:
+			reconcileRepublishTask(ctx, rc.Logger, rc.Store, rc.Broker, t, prior)
+		}
+	}
+	return nil
 }
 
 // reconcileOnce sweeps one batch of stale tasks and applies the two-case split.
@@ -138,7 +207,13 @@ func reconcileRepublishTask(ctx context.Context, logger *zap.Logger, st *store.S
 		return
 	}
 
-	logger.Info("reconcile: republished stale task",
+	// The message is on the queue again, so the publish marker is true again —
+	// and the publish sweep stops considering this task.
+	if err := st.MarkTaskEnqueued(ctx, t.ID); err != nil {
+		logger.Warn("reconcile: enqueue marker failed", zap.String("task_id", t.ID.String()), zap.Error(err))
+	}
+
+	logger.Info("reconcile: republished task",
 		zap.String("task_id", t.ID.String()),
 		zap.String("from_status", string(t.Status)),
 		zap.Int("prior_attempts", prior),

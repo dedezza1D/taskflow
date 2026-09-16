@@ -191,7 +191,15 @@ func main() {
 	// close mid-scan, which is the crash the local queue expects the reconciler to
 	// clean up. Both sweep once at startup, because this process often does not
 	// live long enough to reach a tick.
-	go maintenance.RunReconciler(ctx, logger, st, broker, cfg, pl.MarkDeadLettered)
+	go (&maintenance.Reconciler{
+		Logger:       logger,
+		Store:        st,
+		Broker:       broker,
+		Config:       cfg,
+		OnDeadLetter: pl.MarkDeadLettered,
+		// No publish to lose: the tasks table is the queue here.
+		RecoverUnpublished: false,
+	}).Run(ctx)
 	go maintenance.RunRawRetention(ctx, logger, st, pl, cfg)
 
 	go loop.Run(ctx)

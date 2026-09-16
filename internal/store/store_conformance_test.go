@@ -688,3 +688,80 @@ func TestListsWithoutFilters(t *testing.T) {
 		}
 	})
 }
+
+// The publish marker is what separates "committed but never delivered" from
+// "delivered and waiting for a free worker". Getting that wrong in either
+// direction is expensive: a lost publish nobody rescues, or a healthy backlog
+// republished on every sweep.
+func TestUnpublishedTasksQuery(t *testing.T) {
+	eachBackend(t, func(t *testing.T, st *Store) {
+		ctx := context.Background()
+		orgID := seedOrg(t, st)
+
+		mk := func() *Task {
+			task, err := st.CreateTask(ctx, CreateTaskParams{
+				Type: conformanceTaskType, Payload: []byte(`{}`), Priority: PriorityNormal, OrgID: orgID,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return task
+		}
+		lost, delivered, running := mk(), mk(), mk()
+
+		if err := st.MarkTaskEnqueued(ctx, delivered.ID); err != nil {
+			t.Fatalf("MarkTaskEnqueued: %v", err)
+		}
+		if _, err := st.UpdateTaskStatus(ctx, running.ID, running.Version, StatusProcessing); err != nil {
+			t.Fatal(err)
+		}
+
+		contains := func(tasks []Task, id uuid.UUID) bool {
+			for _, task := range tasks {
+				if task.ID == id {
+					return true
+				}
+			}
+			return false
+		}
+
+		pending, err := st.ListUnpublishedTasks(ctx, time.Now().Add(time.Minute), 500)
+		if err != nil {
+			t.Fatalf("ListUnpublishedTasks: %v", err)
+		}
+		if !contains(pending, lost.ID) {
+			t.Error("a task with no confirmed publish is missing; nothing would ever deliver it")
+		}
+		if contains(pending, delivered.ID) {
+			t.Error("a published task was listed; a backlog would be republished on every sweep")
+		}
+		if contains(pending, running.ID) {
+			t.Error("a task already being processed was listed as unpublished")
+		}
+
+		// Idempotent, and it does not move a marker that already exists.
+		if err := st.MarkTaskEnqueued(ctx, lost.ID); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.MarkTaskEnqueued(ctx, lost.ID); err != nil {
+			t.Fatalf("second MarkTaskEnqueued: %v", err)
+		}
+		after, err := st.ListUnpublishedTasks(ctx, time.Now().Add(time.Minute), 500)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if contains(after, lost.ID) {
+			t.Error("marking the publish left the task pending — the sweep would loop forever")
+		}
+
+		// A task newer than the cutoff is still mid-request, not lost.
+		fresh := mk()
+		recent, err := st.ListUnpublishedTasks(ctx, time.Now().Add(-time.Hour), 500)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if contains(recent, fresh.ID) {
+			t.Error("a task created seconds ago was treated as a lost publish")
+		}
+	})
+}

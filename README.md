@@ -27,7 +27,8 @@ limitations. See [docs/PIPELINE.md](docs/PIPELINE.md) for the pipeline design (c
 ## ✨ Highlights
 
 - **Distributed task queue** with JetStream (**at-least-once delivery**)
-- **Best-effort exactly-once behavior** via DB idempotency + task state transitions
+- **At-least-once end to end**, absorbed by idempotent processing — not by calling it exactly-once
+- **Transactional outbox on the task row**: a publish lost between COMMIT and NATS is republished in seconds
 - **Priority routing**: `tasks.high`, `tasks.normal`, `tasks.low`
 - **Retries with backoff** + max attempts
 - **Dead Letter Queue**: permanent failures published to `tasks.dlq`
@@ -81,6 +82,9 @@ flowchart LR
     STAGES -->|artifacts| OBJ
     W -->|"attempts, status"| PG
     W -->|"failed for good"| DLQ
+    REC["Reconciler"]
+    PG -.->|"no publish confirmed, or stale"| REC
+    REC -.->|republish| JS
 ```
 
 The **desktop build** is the same diagram with two boxes replaced: SQLite for
@@ -96,6 +100,46 @@ one file, loopback only. See [Desktop build](#-desktop-build-local-only).
 5. Worker records an execution attempt (`task_executions`)
 6. Task is marked `completed` or `failed`
 7. Permanent failures publish a DLQ message (`tasks.dlq`)
+
+### What is actually guaranteed
+
+Every hop is **at-least-once**. Nothing here is exactly-once, and the word is
+not used: what makes duplicates harmless is that processing is idempotent, not
+that delivery is unique.
+
+| Hop | Guarantee | What absorbs a duplicate |
+|---|---|---|
+| API → PostgreSQL | committed, or the request failed | — |
+| PostgreSQL → JetStream | at-least-once, recovered by the publish marker | a redelivered task is claimed once |
+| JetStream → worker | at-least-once (JetStream's own semantics) | optimistic claim + terminal-status ack |
+| worker → execution ledger | at-least-once | unique `(task_id, attempt)` index |
+
+**The dual write, and what closes it.** Creating a task writes a row and then
+publishes a message: two systems, with a crash window between them. The task
+row carries `enqueued_at`, stamped only when a publish is confirmed — the
+transactional-outbox marker, on the row that already exists. A separate outbox
+table stores an event that cannot be rebuilt from committed state; here the
+message is `{task_id, priority}`, which the row itself holds, so a second copy
+would be a copy of what is already durable.
+
+NULL means *committed, never delivered*, and nothing can be working on such a
+task, because no worker ever saw a message for it. So it is republished within
+seconds (`WORKER_PUBLISH_RECOVERY_DELAY`, default 15s) instead of waiting out
+the staleness window that the other failure — a worker that died mid-flight —
+genuinely needs, since that one must not be rescued out from under a process
+still running it. One sweep serving both is what used to make a lost publish
+wait ten minutes.
+
+Republishing a task that *was* in fact delivered is safe rather than avoided:
+the worker claims optimistically and acks anything it finds terminal or already
+in flight.
+
+**Verified against the real thing**, not argued: with NATS stopped, a created
+task stays `queued` with no publish marker; when NATS comes back the reconciler
+republishes it and the worker completes it — observed at the first 5-second
+tick. `internal/maintenance/publish_recovery_test.go` covers which rows the
+sweep selects; the outage itself was run by hand against Postgres and NATS in
+Docker, and is not part of the automated suite.
 
 ---
 
@@ -450,6 +494,7 @@ Environment variables:
 | `OBJECTS_DIR` | `data/objects` | Object storage root, shared by API and worker. Must be absolute with `ENV=prod` — the relative default would give each container its own private copy |
 | `MAX_UPLOAD_BYTES` | `26214400` (25 MiB) | Upload ceiling; larger bodies get `413` |
 | `WORKER_OCR_TIMEOUT` | `2m` | OCR sub-ceiling; must be `< WORKER_MAX_PROCESSING` |
+| `WORKER_PUBLISH_RECOVERY_DELAY` | `15s` | How long a committed task may sit with no confirmed publish before the reconciler republishes it. Nothing can be working on such a task, so this only has to clear the gap between INSERT and publish |
 | `WORKER_RAW_RETENTION` | `24h` | Safety net for the raw-material sweep. A completed document is shredded **inline**; this bounds only dead-lettered ones |
 | `AUTH_ENABLED` | `true` | `false` runs every request as a single local admin — for the desktop build only; refused when `ENV=prod` |
 | `SECURE_COOKIES` | `false` | Marks the session cookie `Secure`. Required with `ENV=prod`; a `Secure` cookie over plain HTTP is dropped by the browser, so leave it off for the Vite dev server |
