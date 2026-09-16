@@ -1,15 +1,22 @@
-# TaskFlow
+# TaskFlow Compliance
 
-**TaskFlow** is a production-style distributed task queue and execution-tracking platform built with **Go**, **NATS JetStream**, and **PostgreSQL** — and, built on that engine, a **GDPR compliance document pipeline**:
+**Find the personal data in a document, and be able to prove what happened to it afterwards.** Upload a PDF or a scan; it comes back as a GDPR/LGPD report naming the categories of personal data found and the obligations they trigger — and the document's own bytes are destroyed the moment that report exists.
+
+The engine underneath is a distributed task queue built for the job (**Go**, **NATS JetStream**, **PostgreSQL**), and the same code ships two ways: a served deployment behind nginx, and a single-binary desktop app where no document ever leaves the machine.
+
+[![CI](https://github.com/dedezza1D/taskflow/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/dedezza1D/taskflow/actions/workflows/ci.yml)
+[![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+> **One engine, one domain, two deployments.** The queue is not a side project next to the compliance tool: it is what makes the compliance claims possible — checkpointed stages, bounded retries, a per-attempt audit trail, and a dead-letter path that still ends with the document marked failed *at a named stage*. The desktop build is the same engine with two seams swapped (`store.DB`, `queue.Broker`), because a scanner for personal data is most useful where the data already is.
+
+The contract, in one sentence:
 
 > TaskFlow runs each document through **OCR → PII → compliance-report** as checkpointed, independently-retryable stages. Every document reaches a terminal outcome — report generated, or dead-lettered at stage X — with at-least-once idempotent execution, bounded durable-attempt retries, and a full per-stage audit, and with **no document content or PII leaking into the queue, DLQ, logs, traces, or audit error fields**.
 
 See [docs/MANUAL.md](docs/MANUAL.md) for the user manual — the three jobs the
 tool exists for, what each role can do, how to read a verdict, and the known
-limitations. See [docs/PIPELINE.md](docs/PIPELINE.md) for the pipeline design (checkpoints, C1–C4 compliance guarantees, erasure order, deferred scope) and the `/api/v1/documents` endpoints. The engine below demonstrates reliable asynchronous processing with retries, execution audit history, and operational patterns like **Dead Letter Queues (DLQ)**.
-
-[![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go)](https://go.dev/)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+limitations. See [docs/PIPELINE.md](docs/PIPELINE.md) for the pipeline design (checkpoints, C1–C4 compliance guarantees, erasure order, deferred scope) and the `/api/v1/documents` endpoints.
 
 ---
 
@@ -30,6 +37,7 @@ limitations. See [docs/PIPELINE.md](docs/PIPELINE.md) for the pipeline design (c
 ## 📋 Table of Contents
 
 - [Architecture](#-architecture)
+- [Design decisions](#-design-decisions-and-what-they-cost)
 - [Quick Start](#-quick-start)
 - [API](#-api)
 - [Frontend](#-frontend)
@@ -45,28 +53,36 @@ limitations. See [docs/PIPELINE.md](docs/PIPELINE.md) for the pipeline design (c
 
 ## 🏗 Architecture
 
-```text
-┌─────────────┐
-│   Client    │
-└──────┬──────┘
-       │ HTTP
-       ▼
-┌─────────────┐      ┌──────────────┐
-│  API Server │─────▶│  PostgreSQL   │
-└──────┬──────┘      └──────────────┘
-       │ publish task message
-       ▼
-┌─────────────┐
-│    NATS     │
-│ JetStream   │
-└──────┬──────┘
-       │ pull subscribe
-       ▼
-┌─────────────┐      ┌──────────────┐
-│   Workers   │─────▶│  PostgreSQL   │
-│  (Scaled)   │      └──────────────┘
-└─────────────┘
+The upload path carries **bytes** to object storage and a **reference** to the
+queue. That split is what every compliance guarantee rests on: nothing
+PII-bearing is ever in a message, a DLQ entry, a log line or a span.
+
+```mermaid
+flowchart TB
+    UI["Browser or desktop window<br/>(React SPA)"]
+    NGINX["nginx — TLS, per-IP limits"]
+    API["API (Go)"]
+    OBJ[("Object storage<br/>original → ocr.txt → findings → report")]
+    PG[("PostgreSQL<br/>documents · tasks · executions · artifacts")]
+    JS{{"NATS JetStream<br/>tasks.high / normal / low"}}
+    W["Worker"]
+    STAGES["OCR → PII → report<br/>checkpointed, resumable"]
+    DLQ{{"tasks.dlq — references only"}}
+
+    UI -->|HTTPS| NGINX --> API
+    API -->|document bytes| OBJ
+    API -->|document + task rows| PG
+    API -->|"{document_id, storage_uri}"| JS
+    JS -->|pull| W --> STAGES
+    STAGES -->|"artifact per stage (atomic)"| OBJ
+    W -->|"attempt ledger, status"| PG
+    W -->|terminal failure| DLQ
+    W -.->|"reconciler + retention sweeps"| PG
 ```
+
+The **desktop build** is the same diagram with two boxes replaced: SQLite for
+PostgreSQL, the `tasks` table itself for JetStream, and no nginx — one process,
+one file, loopback only. See [Desktop build](#-desktop-build-local-only).
 
 ### Task lifecycle
 
@@ -77,6 +93,51 @@ limitations. See [docs/PIPELINE.md](docs/PIPELINE.md) for the pipeline design (c
 5. Worker records an execution attempt (`task_executions`)
 6. Task is marked `completed` or `failed`
 7. Permanent failures publish a DLQ message (`tasks.dlq`)
+
+---
+
+## 🧭 Design decisions, and what they cost
+
+Three choices shaped most of the code. Each one had a cheaper alternative that
+was wrong for a specific, findable reason.
+
+**1. One checkpointed task, not one task per stage.** Splitting OCR, PII and
+report into three queues is the obvious "distributed" answer, and it buys an
+independent lifecycle per stage — which nothing here needs yet. Instead the
+three run inline in one `document.process` task, with each stage writing its
+artifact atomically *before* recording its row, so "the row exists" means "the
+stage finished". A worker killed mid-OCR redelivers and **resumes** rather than
+redoing. *The cost:* a slow OCR occupies a worker slot for the whole document,
+and splitting later means moving a stage out — which the per-stage checkpoint
+layout is designed to make cheap.
+
+**2. The queue carries references; the bytes never move.** A payload of
+`{document_id, storage_uri}` means no message, DLQ entry (7-day retention), log
+line or trace span can hold personal data — a guarantee by construction rather
+than by discipline. Errors are the leak nobody plans for, so every error passes
+through one chokepoint, `worker.ScrubError`, which redacts using **the same
+detector set the PII stage uses**: one pattern set, two enforcement points, no
+drift. *The cost:* the guarantee is only as strong as the detectors, and a
+regex cannot see free-text personal data — which is why the honest statement is
+in [docs/PIPELINE.md](docs/PIPELINE.md) instead of a claim of completeness.
+
+**3. Two storage backends behind one seam, with a conformance suite.** The
+desktop build needs SQLite; the served one needs PostgreSQL. Every store method
+is written once in PostgreSQL idiom and must behave identically on both, which
+only stays true while **both are exercised by the same cases** (`eachBackend`).
+That suite has already caught what the SQLite-only version missed — a query
+PostgreSQL rejected outright, returning 500 on every list in production.
+Related: **no test in this repo skips**. With the database down, the API package
+once reported `ok` having run 4 of its 38 tests, with authentication and
+password recovery quietly uncovered. A test that cannot run has not passed, and
+the suite now says so by failing.
+
+A fourth, learned the hard way: the erasure path and the pipeline are
+**concurrent**, and a correct-looking sequence can still be outrun. Deleting a
+document while its OCR stage was running left the extracted text in a directory
+no row pointed at any more — invisible to both erasure and the retention sweep.
+The fix is a fence with an ordering argument, written out in
+[docs/PIPELINE.md](docs/PIPELINE.md#compliance-guarantees).
 
 ---
 
