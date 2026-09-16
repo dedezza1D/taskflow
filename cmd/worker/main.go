@@ -11,6 +11,7 @@ import (
 
 	"github.com/dedezza1D/taskflow/internal/config"
 	"github.com/dedezza1D/taskflow/internal/logging"
+	"github.com/dedezza1D/taskflow/internal/maintenance"
 	"github.com/dedezza1D/taskflow/internal/objects"
 	"github.com/dedezza1D/taskflow/internal/observability"
 	"github.com/dedezza1D/taskflow/internal/pipeline"
@@ -118,7 +119,6 @@ func main() {
 		Config:       cfg,
 		OnDeadLetter: pl.MarkDeadLettered,
 	}
-	onDeadLetter = pl.MarkDeadLettered
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -141,11 +141,11 @@ func main() {
 	}()
 
 	// Background reconciler: rescues stuck tasks (lost enqueue / crashed worker).
-	go runReconciler(ctx, logger, st, broker, cfg)
+	go maintenance.RunReconciler(ctx, logger, st, broker, cfg, pl.MarkDeadLettered)
 
 	// Background retention sweep: destroys raw material left by documents that
 	// dead-lettered, which have no completion event to shred against.
-	go runRawRetention(ctx, logger, st, pl, cfg)
+	go maintenance.RunRawRetention(ctx, logger, st, pl, cfg)
 
 	// Background auth housekeeping: expired sessions and recovery links.
 	go runAuthHousekeeping(ctx, logger, st)

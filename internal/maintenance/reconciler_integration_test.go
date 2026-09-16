@@ -1,4 +1,4 @@
-package main
+package maintenance
 
 import (
 	"context"
@@ -57,7 +57,7 @@ func TestReconcileOnce_Integration(t *testing.T) {
 
 	defer func() { _, _ = pool.Exec(ctx, `DELETE FROM tasks WHERE id = ANY($1)`, []uuid.UUID{id1, id2}) }()
 
-	if err := reconcileOnce(ctx, zap.NewNop(), st, q, cfg); err != nil {
+	if err := reconcileOnce(ctx, zap.NewNop(), st, q, cfg, nil); err != nil {
 		t.Fatalf("reconcileOnce: %v", err)
 	}
 
@@ -81,7 +81,7 @@ func TestReconcileOnce_Integration(t *testing.T) {
 
 	// Second sweep: id1 was debounced (updated_at refreshed within the staleness
 	// window), so it must NOT be re-selected/re-published — guards the amplification fix.
-	if err := reconcileOnce(ctx, zap.NewNop(), st, q, cfg); err != nil {
+	if err := reconcileOnce(ctx, zap.NewNop(), st, q, cfg, nil); err != nil {
 		t.Fatalf("reconcileOnce (2nd): %v", err)
 	}
 	_, v1b := taskState(t, ctx, pool, id1)

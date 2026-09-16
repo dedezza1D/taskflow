@@ -33,6 +33,7 @@ import (
 	"github.com/dedezza1D/taskflow/internal/auth"
 	"github.com/dedezza1D/taskflow/internal/config"
 	"github.com/dedezza1D/taskflow/internal/logging"
+	"github.com/dedezza1D/taskflow/internal/maintenance"
 	"github.com/dedezza1D/taskflow/internal/objects"
 	"github.com/dedezza1D/taskflow/internal/pipeline"
 	"github.com/dedezza1D/taskflow/internal/queue"
@@ -183,6 +184,15 @@ func main() {
 			cancel()
 		}
 	}()
+
+	// The same background sweeps the served worker runs. Without them a desktop
+	// install kept the original of every dead-lettered document forever - the
+	// documents nobody revisits - and never rescued a task left 'processing' by a
+	// close mid-scan, which is the crash the local queue expects the reconciler to
+	// clean up. Both sweep once at startup, because this process often does not
+	// live long enough to reach a tick.
+	go maintenance.RunReconciler(ctx, logger, st, broker, cfg, pl.MarkDeadLettered)
+	go maintenance.RunRawRetention(ctx, logger, st, pl, cfg)
 
 	go loop.Run(ctx)
 
