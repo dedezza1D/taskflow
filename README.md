@@ -58,7 +58,7 @@ queue. That split is what every compliance guarantee rests on: nothing
 PII-bearing is ever in a message, a DLQ entry, a log line or a span.
 
 ```mermaid
-flowchart TB
+flowchart LR
     UI["Browser or desktop window<br/>(React SPA)"]
     NGINX["nginx — TLS, per-IP limits"]
     API["API (Go)"]
