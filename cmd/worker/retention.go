@@ -51,17 +51,31 @@ func sweepRawOnce(ctx context.Context, logger *zap.Logger, st *store.Store, pl *
 	if err != nil {
 		return err
 	}
-	if len(docs) == 0 {
-		return nil
-	}
-
 	for i := range docs {
 		pl.ShredRaw(ctx, &docs[i])
 	}
 
-	logger.Info("raw retention sweep pass",
-		zap.Int("documents", len(docs)),
-		zap.Time("cutoff", cutoff),
-	)
+	// Uploads that never got a task: no pipeline run will ever reach them, so
+	// the same retention window is all the raw material gets.
+	orphans, err := st.ListOrphanedUploads(ctx, cutoff, 100)
+	if err != nil {
+		return err
+	}
+	discarded := 0
+	for i := range orphans {
+		if err := pl.DiscardOrphanedUpload(ctx, &orphans[i]); err != nil {
+			logger.Warn("orphaned upload not discarded; will retry", zap.Error(err))
+			continue
+		}
+		discarded++
+	}
+
+	if len(docs) > 0 || len(orphans) > 0 {
+		logger.Info("raw retention sweep pass",
+			zap.Int("documents", len(docs)),
+			zap.Int("orphaned_uploads", discarded),
+			zap.Time("cutoff", cutoff),
+		)
+	}
 	return nil
 }

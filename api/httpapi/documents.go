@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/dedezza1D/taskflow/internal/observability"
 	"github.com/dedezza1D/taskflow/internal/pipeline"
@@ -143,10 +145,10 @@ func (s *Server) handleCreateDocument(w http.ResponseWriter, r *http.Request) {
 		OrgID:       principal(r).OrgID,
 	})
 	if err != nil {
-		// Best-effort cleanup: never leave orphaned bytes without a row to
-		// enumerate them from (erasure depends on enumerability).
-		_ = s.objects.RemovePrefix(r.Context(), "documents/"+docID.String())
+		// Never leave orphaned bytes without a row to enumerate them from
+		// (erasure depends on enumerability).
 		s.logger.Error("create document failed", zap.Error(err))
+		s.discardUpload(r.Context(), docID, nil)
 		writeErr(w, http.StatusInternalServerError, "internal_error", "failed to create document")
 		return
 	}
@@ -157,6 +159,7 @@ func (s *Server) handleCreateDocument(w http.ResponseWriter, r *http.Request) {
 		ContentType: contentType,
 	})
 	if err != nil {
+		s.discardUpload(r.Context(), doc.ID, nil)
 		writeErr(w, http.StatusInternalServerError, "internal_error", "failed to build task payload")
 		return
 	}
@@ -169,17 +172,53 @@ func (s *Server) handleCreateDocument(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		s.logger.Error("create document task failed", zap.Error(err))
+		s.discardUpload(r.Context(), doc.ID, nil)
 		writeErr(w, http.StatusInternalServerError, "internal_error", "failed to create processing task")
 		return
 	}
+	// The link is not optional: erasure finds the task through it, so a document
+	// without one would leave its task and execution history behind when erased.
 	if err := s.store.SetDocumentTask(r.Context(), doc.ID, task.ID); err != nil {
-		s.logger.Warn("link document to task failed", zap.Error(err))
+		s.logger.Error("link document to task failed", zap.Error(err))
+		s.discardUpload(r.Context(), doc.ID, &task.ID)
+		writeErr(w, http.StatusInternalServerError, "internal_error", "failed to create processing task")
+		return
 	}
 	doc.TaskID = &task.ID
 
 	s.publishTaskMessage(r, task)
 
 	writeJSON(w, http.StatusCreated, createDocumentResponse{Document: *doc, TaskID: task.ID.String()})
+}
+
+// discardUpload undoes a half-finished upload so the client's 500 is true: no
+// document, no task, no bytes. Without it the document stayed "uploaded" with no
+// task to process it, and its original was kept forever — the retention sweep
+// only visits documents that reached a terminal state.
+//
+// Bytes go first and the row last, so a failure part-way leaves the row for the
+// worker's orphaned-upload sweep to find again. The task, when there is one, has
+// not been published yet, so deleting it races with nothing.
+//
+// Deliberately detached from the request context: a client that disconnects
+// must not cancel the cleanup its failed request needs.
+func (s *Server) discardUpload(reqCtx context.Context, docID uuid.UUID, taskID *uuid.UUID) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), 10*time.Second)
+	defer cancel()
+
+	log := s.logger.With(zap.String("document_id", docID.String()))
+	if err := s.objects.RemovePrefix(ctx, "documents/"+docID.String()); err != nil {
+		log.Error("discard upload: object removal failed; left for the orphan sweep", zap.Error(err))
+		return
+	}
+	if taskID != nil {
+		if _, err := s.store.DeleteTask(ctx, *taskID); err != nil {
+			log.Error("discard upload: task deletion failed", zap.Error(err))
+		}
+	}
+	if _, err := s.store.DeleteDocument(ctx, docID); err != nil {
+		log.Error("discard upload: document deletion failed; left for the orphan sweep", zap.Error(err))
+	}
 }
 
 func isSupportedContentType(ct string) bool {

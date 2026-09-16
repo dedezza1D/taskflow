@@ -39,6 +39,8 @@ The task payload is `{document_id, storage_uri, content_type}`. Document bytes n
 
   `cmd/worker` runs a sweep (`WORKER_RAW_RETENTION`, default 24h) as the safety net for the two cases the inline path cannot reach: documents that **dead-lettered**, which have no completion event to shred against and are the ones nobody revisits; and documents whose inline shred failed, where `raw_shredded_at` is deliberately left NULL so the sweep retries instead of stranding bytes.
 
+  **Uploads that never got a task** are a third case. The upload handler undoes a failed upload itself — bytes, task and row — so its 500 is true; what reaches the sweep is only what it could not undo (the process died between inserting the document and linking its task). Such a document is `uploaded` with no `task_id` forever, no pipeline run will reach it, and it never becomes terminal, so the same sweep deletes it outright once it is older than the retention window.
+
 - **Dead-letter → document status**: every terminal path in the engine (permanent error, exhausted attempts, reconciler reap) calls `pipeline.MarkDeadLettered`, which sets `status=failed` and derives `failed_stage` from the **checkpoint ledger** (first stage without an artifact) — correct even for a crash-pill reaped with no error in hand.
 
 ## API
