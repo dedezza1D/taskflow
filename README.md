@@ -59,25 +59,24 @@ PII-bearing is ever in a message, a DLQ entry, a log line or a span.
 
 ```mermaid
 flowchart LR
-    UI["Browser or desktop window<br/>(React SPA)"]
-    NGINX["nginx — TLS, per-IP limits"]
-    API["API (Go)"]
-    OBJ[("Object storage<br/>original → ocr.txt → findings → report")]
-    PG[("PostgreSQL<br/>documents · tasks · executions · artifacts")]
-    JS{{"NATS JetStream<br/>tasks.high / normal / low"}}
+    UI["React SPA"]
+    NGINX["nginx<br/>TLS"]
+    API["API"]
+    OBJ[("Object storage")]
+    PG[("PostgreSQL")]
+    JS{{"JetStream"}}
     W["Worker"]
-    STAGES["OCR → PII → report<br/>checkpointed, resumable"]
-    DLQ{{"tasks.dlq — references only"}}
+    STAGES["OCR → PII → report<br/>checkpointed"]
+    DLQ{{"tasks.dlq"}}
 
-    UI -->|HTTPS| NGINX --> API
-    API -->|document bytes| OBJ
-    API -->|document + task rows| PG
-    API -->|"{document_id, storage_uri}"| JS
+    UI --> NGINX --> API
+    API -->|bytes| OBJ
+    API -->|rows| PG
+    API -->|reference| JS
     JS -->|pull| W --> STAGES
-    STAGES -->|"artifact per stage (atomic)"| OBJ
-    W -->|"attempt ledger, status"| PG
-    W -->|terminal failure| DLQ
-    W -.->|"reconciler + retention sweeps"| PG
+    STAGES -->|artifacts| OBJ
+    W -->|"attempts, status"| PG
+    W -->|"failed for good"| DLQ
 ```
 
 The **desktop build** is the same diagram with two boxes replaced: SQLite for
