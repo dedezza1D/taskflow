@@ -224,6 +224,28 @@ func (m *localMessage) Nak() error {
 	return nil
 }
 
+// NakWithDelay keeps the task marked in flight until the delay has passed, so
+// claim skips it, then releases it exactly as Nak does.
+//
+// The hold lives only in memory, and that is enough: the row is already
+// 'queued', so if the process exits during the wait the task is simply picked
+// up on the next start — sooner than asked, never lost.
+func (m *localMessage) NakWithDelay(delay time.Duration) error {
+	if delay <= 0 {
+		return m.Nak()
+	}
+	m.once.Do(func() {
+		time.AfterFunc(delay, func() {
+			m.queue.release(m.taskID)
+			select {
+			case m.queue.wake <- struct{}{}:
+			default:
+			}
+		})
+	})
+	return nil
+}
+
 // InProgress is a no-op: there is no remote ack deadline to extend. The claim is
 // the in-memory entry, which lives exactly as long as this process does — and a
 // process that dies releases everything at once, which is precisely the case the
