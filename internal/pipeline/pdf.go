@@ -141,14 +141,27 @@ func pdfTextLayer(path string) (string, bool) {
 		if page.V.IsNull() {
 			continue
 		}
-		text, err := page.GetPlainText(nil)
+		// By ROW, not GetPlainText. GetPlainText concatenates the page's text
+		// objects with nothing between them, so the last value on a line is
+		// glued to the first word of the next: "...529.982.247-25E-mail:".
+		// Every detector here ends on a word boundary, and that boundary is
+		// gone, so a CPF, CNPJ, card or IBAN sitting at the end of a line went
+		// undetected — on PDFs with a text layer, which is most of them. The
+		// document looked clean because the text was unreadable to the
+		// detectors, which is the worst way for this tool to be wrong.
+		rows, err := page.GetTextByRow()
 		if err != nil {
 			return "", false
 		}
 		if i > 1 {
 			sb.WriteByte('\f') // page separator, same convention as pdftotext
 		}
-		sb.WriteString(text)
+		for _, row := range rows {
+			for _, word := range row.Content {
+				sb.WriteString(word.S)
+			}
+			sb.WriteByte('\n')
+		}
 	}
 
 	out := sb.String()

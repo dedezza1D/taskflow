@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dedezza1D/taskflow/internal/pii"
 	"github.com/dedezza1D/taskflow/internal/worker"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"go.uber.org/zap"
@@ -278,4 +279,81 @@ func TestSupportedContentTypesIncludesPDF(t *testing.T) {
 		}
 	}
 	t.Fatal("application/pdf missing from SupportedContentTypes")
+}
+
+// buildMultiLinePDF puts several lines on ONE page, which is what a real
+// document looks like and what buildPDF (one line per page) never produced.
+func buildMultiLinePDF(lines []string) []byte {
+	var buf bytes.Buffer
+	var offsets []int
+	addObj := func(body string) {
+		offsets = append(offsets, buf.Len())
+		fmt.Fprintf(&buf, "%d 0 obj\n%s\nendobj\n", len(offsets), body)
+	}
+
+	buf.WriteString("%PDF-1.4\n")
+
+	var content strings.Builder
+	content.WriteString("BT\n")
+	y := 700
+	for _, line := range lines {
+		fmt.Fprintf(&content, "/F1 12 Tf 1 0 0 1 72 %d Tm (%s) Tj\n", y, line)
+		y -= 24
+	}
+	content.WriteString("ET\n")
+
+	addObj("<< /Type /Catalog /Pages 2 0 R >>")
+	addObj("<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+	addObj("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>")
+	addObj(fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", content.Len(), content.String()))
+	addObj("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+
+	xrefPos := buf.Len()
+	fmt.Fprintf(&buf, "xref\n0 %d\n0000000000 65535 f \n", len(offsets)+1)
+	for _, off := range offsets {
+		fmt.Fprintf(&buf, "%010d 00000 n \n", off)
+	}
+	fmt.Fprintf(&buf, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(offsets)+1, xrefPos)
+	return buf.Bytes()
+}
+
+// The text layer must come back with its LINES intact. Extracted as one run,
+// the last value on a line is glued to the first word of the next
+// ("...529.982.247-25E-mail:"), which destroys the word boundary every detector
+// ends on: the document then reports clean while carrying a CPF, a CNPJ, a card
+// and an IBAN. This is the regression test for that.
+func TestPDFTextLayerKeepsLinesApart(t *testing.T) {
+	p := newPDFTestPipeline()
+
+	lines := []string{
+		"CPF: 529.982.247-25",
+		"E-mail: maria@exemplo.com.br",
+		"CNPJ: 11.222.333/0001-81",
+		"Cartao: 4111 1111 1111 1111",
+		"IBAN: DE89 3704 0044 0532 0130 00",
+		"Fim do documento.",
+	}
+
+	text, err := p.pdfText(context.Background(), buildMultiLinePDF(lines))
+	if err != nil {
+		t.Fatalf("pdfText: %v", err)
+	}
+	for _, line := range lines {
+		if !strings.Contains(text, line) {
+			t.Fatalf("line %q did not survive extraction; got %q", line, text)
+		}
+	}
+	if strings.Contains(text, "247-25E-mail") {
+		t.Fatalf("lines were glued together: %q", text)
+	}
+
+	found := map[string]int{}
+	for _, f := range pii.Detect(text) {
+		found[f.Category]++
+	}
+	for _, want := range []string{pii.CategoryCPF, pii.CategoryCNPJ, pii.CategoryCreditCard, pii.CategoryIBAN, pii.CategoryEmail} {
+		if found[want] == 0 {
+			t.Errorf("%s went undetected in a PDF that contains one (found %v)", want, found)
+		}
+	}
 }
