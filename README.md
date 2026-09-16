@@ -50,6 +50,7 @@ limitations. See [docs/PIPELINE.md](docs/PIPELINE.md) for the pipeline design (c
 - [TLS](#-tls)
 - [Configuration](#️-configuration)
 - [Testing](#-testing)
+- [Load profile](#-load-profile)
 - [Troubleshooting](#-troubleshooting)
 - [Contributing](#-contributing)
 - [License](#-license)
@@ -570,11 +571,59 @@ cd web && npm run test:watch
 Covers the two pieces that decide what the operator sees: the inventory
 arithmetic in `lib/compliance.ts` and the report-fetching pool in `hooks.ts`.
 
+### Load profile
+
+The engine under a backlog, against real PostgreSQL and real NATS. Behind a
+build tag; the measured numbers are in [Load profile](#-load-profile).
+
+```bash
+go test -tags load ./internal/loadtest -v -timeout 15m
+```
+
 ### Smoke test
 
 ```bash
 ./scripts/smoke.sh
 ```
+
+---
+
+## 📈 Load profile
+
+Numbers below were measured, not estimated. Reproduce them with:
+
+```bash
+docker compose up -d postgres nats
+go test -tags load ./internal/loadtest -v -timeout 15m
+```
+
+`LOAD_TASKS`, `LOAD_WORKERS` and `LOAD_FAIL_RATE` tune the run; it is behind a
+build tag because it is the only thing here that needs NATS, and because a
+benchmark does not belong in every CI run.
+
+| Run | Wall | Throughput | p50 | p95 | p99 | Success | Retry |
+|---|---|---|---|---|---|---|---|
+| 1,000 tasks · 10 workers | 2.4s | 421/s | 867ms | 1.17s | 1.20s | 100% | 3.9% |
+| 10,000 tasks · 10 workers | 33.9s | 295/s | 6.8s | 11.8s | 12.2s | 100% | 5.3% |
+
+**Read the latency as queue depth, not as processing time.** It is measured from
+publish to handler return, and the producers outrun the pool on purpose: 10,000
+tasks are published in 21s and drained at ~295/s, so by the middle of the run a
+task waits behind thousands of others. That wait is the number. Per-attempt
+processing is milliseconds — the handler sleeps 5ms and the rest is the engine's
+own bookkeeping: claim, execution row, terminal status, ack.
+
+**The retry rate is deliberate.** One task in twenty is made to fail its first
+attempt, so the run exercises the retry path rather than reporting a clean
+happy path; 100% still reach `completed`, which is the property worth checking
+at load. The measured rate lands a little under 5% because the selection is a
+hash of the task id, not a quota.
+
+**What this is not.** A single laptop (Windows 11, Docker Desktop for PostgreSQL
+and NATS), workers as goroutines in one process rather than ten containers, and
+a handler that does no real work. It says the engine keeps its guarantees under
+a backlog and where the throughput sits on this hardware; it says nothing about
+a production deployment's capacity.
 
 ---
 
