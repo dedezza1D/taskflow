@@ -88,6 +88,15 @@ jobs:
         run: |
           go test ./... -v
 
+      # The race detector needs cgo, so it cannot run on a Windows dev machine
+      # without a C toolchain — this job is the only place it actually runs.
+      # Worth the second pass: the worker fans tasks out across goroutines and
+      # settles messages from them, and a data race there is invisible to a
+      # suite that only checks results.
+      - name: Run tests (race detector)
+        run: |
+          go test -race ./...
+
   web:
     name: Frontend (lint + test + typecheck + build)
     runs-on: ubuntu-latest
