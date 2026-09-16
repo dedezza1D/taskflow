@@ -79,7 +79,9 @@ func (s *Server) issueRecoveryEmail(ctx context.Context, email string) {
 
 	user, err := s.store.GetUserByEmail(ctx, email)
 	if errors.Is(err, store.ErrNotFound) {
-		s.logger.Info("recovery requested for unknown address", zap.String("email", email))
+		// The address is not logged: it is personal data, and here it is
+		// whatever the caller chose to type.
+		s.logger.Info("recovery requested for unknown address")
 		return
 	}
 	if err != nil {
