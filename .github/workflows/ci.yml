@@ -89,7 +89,7 @@ jobs:
           go test ./... -v
 
   web:
-    name: Frontend (typecheck + lint + build)
+    name: Frontend (lint + test + typecheck + build)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -111,6 +111,11 @@ jobs:
 
       - name: Lint
         run: npm run lint
+
+      # vitest: the inventory arithmetic, the report-fetching pool, and the
+      # error translations the operator actually reads.
+      - name: Test
+        run: npm test
 
       # `npm run build` is `tsc -b && vite build` — this is the only place the
       # TypeScript is actually type-checked.
