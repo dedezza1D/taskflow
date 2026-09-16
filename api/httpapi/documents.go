@@ -22,12 +22,26 @@ import (
 	"go.uber.org/zap"
 )
 
-// publishTaskMessage enqueues a task message (reference payload only) with
-// trace/request-id propagation. A publish failure is logged, not surfaced: the
-// task row is durable and the reconciler recovers lost enqueues at every
-// publish point — this is that contract, applied at the API publish point.
+// publishTaskMessage enqueues a task message (reference payload only) and, on
+// success, stamps the task's publish marker.
+//
+// Creating a task writes to two systems: the row commits to PostgreSQL, the
+// message goes to JetStream. Nothing makes those atomic, so the marker is what
+// tells the two failure modes apart afterwards. enqueued_at NULL means the
+// delivery was never confirmed, and the reconciler's publish sweep republishes
+// within seconds — nothing can be working on such a task, because no message
+// was ever delivered. This is the transactional outbox, on the row the task
+// already has: the message is {task_id, priority}, which the row itself holds,
+// so there is no second copy of it to store.
+//
+// A publish failure is logged rather than surfaced: the row is durable and the
+// sweep will pick it up, so the caller's task is queued either way.
 func (s *Server) publishTaskMessage(r *http.Request, task *store.Task) {
 	if s.queue == nil {
+		// Desktop: the tasks table IS the queue, so there is no delivery to
+		// confirm and no publish to lose. Marking it keeps the row out of a
+		// sweep that would have nothing to do for it.
+		s.markEnqueued(r.Context(), task.ID)
 		return
 	}
 	hdr := nats.Header{}
@@ -43,6 +57,24 @@ func (s *Server) publishTaskMessage(r *http.Request, task *store.Task) {
 	}, hdr)
 	if err != nil {
 		s.logger.Warn("failed to enqueue task", zap.Error(err), zap.String("task_id", task.ID.String()))
+		return
+	}
+	s.markEnqueued(r.Context(), task.ID)
+}
+
+// markEnqueued records a confirmed delivery. Detached from the request, because
+// a client that disconnects after its task was published must not leave the row
+// looking unpublished — the sweep would then republish work that is already on
+// the queue.
+func (s *Server) markEnqueued(reqCtx context.Context, taskID uuid.UUID) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), 5*time.Second)
+	defer cancel()
+
+	if err := s.store.MarkTaskEnqueued(ctx, taskID); err != nil {
+		// Harmless on its own: the task is on the queue and will run. The cost
+		// is one redundant republish when the sweep sees the NULL.
+		s.logger.Warn("enqueue marker failed",
+			zap.Error(err), zap.String("task_id", taskID.String()))
 	}
 }
 

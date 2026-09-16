@@ -43,15 +43,21 @@ func TestReconcileOnce_Integration(t *testing.T) {
 	}
 
 	// republish case: stale 'queued', no executions.
+	//
+	// Backdated 30 days, not an hour: the test database is shared with every
+	// other package, ListStaleTasks takes the 100 oldest, and rows those tests
+	// leave behind are all "about now". An hour was enough to be stale and not
+	// enough to be first in line, so the sweep filled its batch with other
+	// people's rows and this test asserted on a pass that never reached its own.
 	id1 := uuid.New()
 	// The legacy organisation is seeded by migrations 003 and 007.
 	mustExec(t, ctx, pool, `INSERT INTO tasks (id,type,payload,priority,status,created_at,updated_at,version,org_id)
-		VALUES ($1,'demo','{}','normal','queued', now()-interval '1 hour', now()-interval '1 hour', 1, '00000000-0000-0000-0000-000000000001')`, id1)
+		VALUES ($1,'demo','{}','normal','queued', now()-interval '30 days', now()-interval '30 days', 1, '00000000-0000-0000-0000-000000000001')`, id1)
 
 	// dead-letter case: stale 'processing' with executions at the cap.
 	id2 := uuid.New()
 	mustExec(t, ctx, pool, `INSERT INTO tasks (id,type,payload,priority,status,created_at,updated_at,version,org_id)
-		VALUES ($1,'demo','{}','normal','processing', now()-interval '1 hour', now()-interval '1 hour', 1, '00000000-0000-0000-0000-000000000001')`, id2)
+		VALUES ($1,'demo','{}','normal','processing', now()-interval '30 days', now()-interval '30 days', 1, '00000000-0000-0000-0000-000000000001')`, id2)
 	mustExec(t, ctx, pool, `INSERT INTO task_executions (id,task_id,attempt,status,started_at,finished_at)
 		SELECT gen_random_uuid(), $1, g, 'failed', now()-interval '1 hour', now()-interval '1 hour' FROM generate_series(1,5) g`, id2)
 

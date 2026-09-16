@@ -83,8 +83,38 @@ func upgradeSQLite(ctx context.Context, db *sql.DB) error {
 			}
 		}
 	}
-	_, err = db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_tasks_org_created ON tasks(org_id, created_at DESC);`)
-	return err
+	if _, err := db.ExecContext(ctx,
+		`CREATE INDEX IF NOT EXISTS idx_tasks_org_created ON tasks(org_id, created_at DESC);`); err != nil {
+		return err
+	}
+
+	// enqueued_at (migration 008 on PostgreSQL). Rows written before it existed
+	// were enqueued under the old path, so they count as published; leaving them
+	// NULL would hand every one of them to the publish-recovery sweep.
+	hasEnqueued, err := sqliteHasColumn(ctx, db, "tasks", "enqueued_at")
+	if err != nil {
+		return err
+	}
+	if !hasEnqueued {
+		// The trigger comes off for the backfill, and the schema puts it back.
+		// trg_tasks_updated_at rewrites updated_at on every UPDATE, and
+		// updated_at is what the reconciler's staleness window reads: filling in
+		// a bookkeeping column would otherwise make every task look freshly
+		// updated and hide genuinely stuck ones for a full window.
+		for _, q := range []string{
+			`ALTER TABLE tasks ADD COLUMN enqueued_at TIMESTAMP;`,
+			`DROP TRIGGER IF EXISTS trg_tasks_updated_at;`,
+			`UPDATE tasks SET enqueued_at = created_at WHERE enqueued_at IS NULL;`,
+		} {
+			if _, err := db.ExecContext(ctx, q); err != nil {
+				return err
+			}
+		}
+		if _, err := db.ExecContext(ctx, sqliteSchema); err != nil {
+			return fmt.Errorf("restore schema after enqueued_at backfill: %w", err)
+		}
+	}
+	return nil
 }
 
 func sqliteHasColumn(ctx context.Context, db *sql.DB, table, column string) (bool, error) {

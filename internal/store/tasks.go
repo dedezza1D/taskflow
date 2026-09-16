@@ -219,3 +219,55 @@ RETURNING id, type, payload, priority, status, created_at, updated_at, version;
 	}
 	return &t, nil
 }
+
+// MarkTaskEnqueued records that the task's message reached the queue.
+//
+// This is the transactional-outbox marker (see migration 008): NULL means the
+// row is committed but no delivery was ever confirmed, which is the state a
+// crash between COMMIT and publish leaves behind. Idempotent and not
+// version-guarded — it races with nothing, since it only ever fills a NULL.
+func (s *Store) MarkTaskEnqueued(ctx context.Context, id uuid.UUID) error {
+	_, err := s.db.Exec(ctx,
+		`UPDATE tasks SET enqueued_at = $2 WHERE id = $1 AND enqueued_at IS NULL;`, id, time.Now())
+	return err
+}
+
+// ListUnpublishedTasks returns tasks that are committed, still queued, and have
+// never been confirmed on the queue — a publish that was lost, or never made.
+//
+// Deliberately narrow, because that narrowness is what makes it fast. Nothing
+// can be holding one of these: a worker only sees a task through a message, and
+// there was no message. So the cutoff only has to clear the moment between
+// INSERT and publish, not the processing ceiling the staleness sweep must wait
+// out. A task that reached the queue and is merely waiting for a free worker
+// carries a timestamp and is never selected here, however long the backlog.
+func (s *Store) ListUnpublishedTasks(ctx context.Context, cutoff time.Time, limit int) ([]Task, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+
+	q := `
+SELECT id, type, payload, priority, status, created_at, updated_at, version
+FROM tasks
+WHERE status = 'queued'
+  AND enqueued_at IS NULL
+  AND created_at < $1
+ORDER BY created_at ASC
+LIMIT $2;
+`
+	rows, err := s.db.Query(ctx, q, cutoff, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]Task, 0, limit)
+	for rows.Next() {
+		var t Task
+		if err := rows.Scan(&t.ID, &t.Type, &t.Payload, &t.Priority, &t.Status, &t.CreatedAt, &t.UpdatedAt, &t.Version); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}

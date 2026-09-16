@@ -141,7 +141,17 @@ func main() {
 	}()
 
 	// Background reconciler: rescues stuck tasks (lost enqueue / crashed worker).
-	go maintenance.RunReconciler(ctx, logger, st, broker, cfg, pl.MarkDeadLettered)
+	reconciler := &maintenance.Reconciler{
+		Logger:       logger,
+		Store:        st,
+		Broker:       broker,
+		Config:       cfg,
+		OnDeadLetter: pl.MarkDeadLettered,
+		// Two systems, one crash window: the row commits here and the message
+		// goes to JetStream next.
+		RecoverUnpublished: true,
+	}
+	go reconciler.Run(ctx)
 
 	// Background retention sweep: destroys raw material left by documents that
 	// dead-lettered, which have no completion event to shred against.

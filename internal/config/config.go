@@ -41,6 +41,12 @@ type Config struct {
 	// crashed worker) — see cmd/worker reconcileOnce.
 	WorkerReconcileInterval  time.Duration
 	WorkerReconcileStaleness time.Duration
+	// WorkerPublishRecoveryDelay is how long a committed task may sit without a
+	// confirmed publish before the reconciler republishes it. Seconds, not
+	// minutes: nothing can be working on it, because no message was ever
+	// delivered. It only has to clear the gap a healthy request leaves between
+	// INSERT and publish.
+	WorkerPublishRecoveryDelay time.Duration
 
 	// Document pipeline: object storage root (shared between API and worker),
 	// upload bound, and OCR's own sub-ceiling (must sit under the whole-task
@@ -105,8 +111,9 @@ func Load() *Config {
 		WorkerHeartbeatInterval: getEnvAsDuration("WORKER_HEARTBEAT_INTERVAL", 10*time.Second),
 		WorkerMaxProcessing:     getEnvAsDuration("WORKER_MAX_PROCESSING", 5*time.Minute),
 
-		WorkerReconcileInterval:  getEnvAsDuration("WORKER_RECONCILE_INTERVAL", 1*time.Minute),
-		WorkerReconcileStaleness: getEnvAsDuration("WORKER_RECONCILE_STALENESS", 10*time.Minute),
+		WorkerReconcileInterval:    getEnvAsDuration("WORKER_RECONCILE_INTERVAL", 1*time.Minute),
+		WorkerReconcileStaleness:   getEnvAsDuration("WORKER_RECONCILE_STALENESS", 10*time.Minute),
+		WorkerPublishRecoveryDelay: getEnvAsDuration("WORKER_PUBLISH_RECOVERY_DELAY", 15*time.Second),
 
 		ObjectsDir:       getEnv("OBJECTS_DIR", "data/objects"),
 		MaxUploadBytes:   getEnvAsInt64("MAX_UPLOAD_BYTES", 25<<20),
@@ -180,6 +187,9 @@ func (c *Config) Validate() error {
 	// tasks that are still legitimately running under the lease.
 	if c.WorkerReconcileStaleness <= c.WorkerMaxProcessing {
 		return fmt.Errorf("WORKER_RECONCILE_STALENESS must be > WORKER_MAX_PROCESSING")
+	}
+	if c.WorkerPublishRecoveryDelay <= 0 {
+		return fmt.Errorf("WORKER_PUBLISH_RECOVERY_DELAY must be > 0")
 	}
 	if c.MaxUploadBytes <= 0 {
 		return fmt.Errorf("MAX_UPLOAD_BYTES must be > 0")
