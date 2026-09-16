@@ -8,6 +8,10 @@ The engine underneath is a distributed task queue built for the job (**Go**, **N
 [![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+![The desktop app: a contract goes in, a GDPR/LGPD report comes out](docs/img/demo.gif)
+
+*The desktop build, unedited and at real speed: a PDF contract with fictional data goes in, the pipeline runs OCR → PII → report, and the result names six kinds of personal data, the verdict they add up to, and the obligations they trigger. The original is destroyed the moment the report exists. The file is in [docs/sample](docs/sample/contrato-exemplo.pdf) if you want to run it yourself.*
+
 > **One engine, one domain, two deployments.** The queue is not a side project next to the compliance tool: it is what makes the compliance claims possible — checkpointed stages, bounded retries, a per-attempt audit trail, and a dead-letter path that still ends with the document marked failed *at a named stage*. The desktop build is the same engine with two seams swapped (`store.DB`, `queue.Broker`), because a scanner for personal data is most useful where the data already is.
 
 The contract, in one sentence:
