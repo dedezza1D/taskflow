@@ -249,6 +249,48 @@ LIMIT $2;`
 	return out, rows.Err()
 }
 
+// ListOrphanedUploads returns documents whose upload never finished: still
+// "uploaded", with no task linked, created before cutoff.
+//
+// The upload handler undoes a failed upload itself, so what lands here is what
+// it could not undo — the process died between inserting the row and linking the
+// task, or the cleanup itself failed. Nothing will ever process these, and the
+// raw-retention sweep does not see them either (they never reach a terminal
+// state), so without this their originals would be kept indefinitely.
+//
+// The cutoff must be far behind "now": a live upload sits in exactly this state
+// for the few milliseconds between the insert and the link.
+func (s *Store) ListOrphanedUploads(ctx context.Context, cutoff time.Time, limit int) ([]Document, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	q := `
+SELECT ` + documentColumns + `
+FROM documents
+WHERE status = 'uploaded'
+  AND task_id IS NULL
+  AND created_at < $1
+ORDER BY created_at
+LIMIT $2;`
+
+	rows, err := s.db.Query(ctx, q, cutoff, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]Document, 0)
+	for rows.Next() {
+		var d Document
+		if err := rows.Scan(&d.ID, &d.Filename, &d.ContentType, &d.StorageURI, &d.Status,
+			&d.FailedStage, &d.TaskID, &d.CreatedAt, &d.UpdatedAt, &d.Version, &d.RawShreddedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 // CreateArtifact records a stage checkpoint idempotently: the unique
 // (document_id, stage, kind) index absorbs the at-least-once double-write, and
 // the caller always gets the surviving row back.

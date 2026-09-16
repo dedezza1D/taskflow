@@ -211,6 +211,21 @@ func (p *Pipeline) ShredRaw(ctx context.Context, doc *store.Document) {
 	)
 }
 
+// DiscardOrphanedUpload removes a document whose upload never finished (see
+// store.ListOrphanedUploads): every object under its prefix, then the row.
+// Bytes first, so a failure leaves the row for the next sweep to find. There is
+// no task to delete — having none is what makes it an orphan.
+func (p *Pipeline) DiscardOrphanedUpload(ctx context.Context, doc *store.Document) error {
+	if err := p.objects.RemovePrefix(ctx, "documents/"+doc.ID.String()); err != nil {
+		return fmt.Errorf("discard orphaned upload %s: remove objects: %w", doc.ID, err)
+	}
+	if _, err := p.st.DeleteDocument(ctx, doc.ID); err != nil {
+		return fmt.Errorf("discard orphaned upload %s: delete row: %w", doc.ID, err)
+	}
+	p.logger.Info("orphaned upload discarded", zap.String("document_id", doc.ID.String()))
+	return nil
+}
+
 // stageErr tags an error with its stage for logs/audit (values are scrubbed at
 // the chokepoint; the stage name itself is never sensitive). Wrapping with %w
 // preserves the chain, so worker.IsPermanent still sees a PermanentError inside.

@@ -567,6 +567,65 @@ func TestRawRetentionSweepQuery(t *testing.T) {
 	})
 }
 
+// An upload that got its task is live, however old; one that did not is an
+// orphan only once it is past the cutoff — a live upload is in that exact state
+// for the moment between its insert and its link.
+func TestOrphanedUploadsQuery(t *testing.T) {
+	eachBackend(t, func(t *testing.T, st *Store) {
+		ctx := context.Background()
+		orgID := seedOrg(t, st)
+
+		mk := func(name string) *Document {
+			d, err := st.CreateDocument(ctx, CreateDocumentParams{
+				Filename: name, ContentType: "text/plain", StorageURI: "fs://x", OrgID: orgID,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return d
+		}
+		orphan := mk("orphan.txt")
+		linked := mk("linked.txt")
+		task, err := st.CreateTask(ctx, CreateTaskParams{
+			Type: conformanceTaskType, Payload: []byte(`{}`), Priority: PriorityNormal, OrgID: orgID,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.SetDocumentTask(ctx, linked.ID, task.ID); err != nil {
+			t.Fatal(err)
+		}
+
+		contains := func(docs []Document, id uuid.UUID) bool {
+			for _, d := range docs {
+				if d.ID == id {
+					return true
+				}
+			}
+			return false
+		}
+
+		got, err := st.ListOrphanedUploads(ctx, time.Now().Add(time.Minute), 500)
+		if err != nil {
+			t.Fatalf("ListOrphanedUploads: %v", err)
+		}
+		if !contains(got, orphan.ID) {
+			t.Error("upload with no task missing from the orphan sweep — its original would live forever")
+		}
+		if contains(got, linked.ID) {
+			t.Error("upload with a task listed as orphaned — the sweep would delete a live document")
+		}
+
+		recent, err := st.ListOrphanedUploads(ctx, time.Now().Add(-time.Hour), 500)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if contains(recent, orphan.ID) {
+			t.Error("upload newer than the cutoff listed as orphaned — it may still be mid-request")
+		}
+	})
+}
+
 // The unfiltered list is the shape the UI actually asks for, and it is what
 // PostgreSQL rejected with 42P08 while the SQLite-only suite stayed green:
 // "$1 IS NULL" gives it nothing to infer the parameter type from, so it refused
