@@ -26,6 +26,12 @@ CORS, and the exact same frontend build the served deployment uses.
 
 Nothing listens outside loopback, and no document leaves the machine.
 
+The background sweeps run here too, from `internal/maintenance`: the reconciler
+rescues a task left `processing` by a close mid-scan, and the retention sweep
+destroys the raw material of documents that dead-lettered and discards uploads
+that never got a task. Both run once at startup, because this process often
+does not live long enough to reach a tick.
+
 ### Loopback is not access control
 
 There are no user accounts, but loopback alone does not keep others out: any web

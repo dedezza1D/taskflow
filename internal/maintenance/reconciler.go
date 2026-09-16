@@ -1,4 +1,13 @@
-package main
+// Package maintenance holds the background sweeps that keep a deployment
+// honest: rescuing tasks whose message was lost, and destroying raw material
+// the pipeline no longer needs.
+//
+// They used to live in cmd/worker, which meant the desktop build — the same
+// engine in one process - ran none of them. A document that dead-lettered
+// there kept its original forever, and a task left 'processing' by a crash was
+// never rescued, even though the local queue's design says the reconciler is
+// what rescues it.
+package maintenance
 
 import (
 	"context"
@@ -37,11 +46,18 @@ func decideReconcile(priorAttempts, maxAttempts int) reconcileAction {
 	return reconcileRepublish
 }
 
-// runReconciler runs reconcileOnce on a ticker until ctx is cancelled. It is safe
+// DeadLetterFunc is called when a task terminally fails, so a domain can
+// project the outcome onto its own entities — the document pipeline uses it to
+// mark the document failed at its stage.
+type DeadLetterFunc func(ctx context.Context, t *store.Task, reason error)
+
+// RunReconciler runs a pass on a ticker until ctx is cancelled, starting with
+// one immediately: a process that restarts more often than the interval would
+// otherwise never rescue anything, which is every desktop run. It is safe
 // to run in every worker replica: each rescue is claimed with an optimistic-locked
 // status write before any publish, so concurrent sweeps single-flight down to one
 // republish/DLQ per task rather than amplifying with replica count.
-func runReconciler(ctx context.Context, logger *zap.Logger, st *store.Store, q queue.Broker, cfg *config.Config) {
+func RunReconciler(ctx context.Context, logger *zap.Logger, st *store.Store, q queue.Broker, cfg *config.Config, onDeadLetter DeadLetterFunc) {
 	ticker := time.NewTicker(cfg.WorkerReconcileInterval)
 	defer ticker.Stop()
 
@@ -50,13 +66,17 @@ func runReconciler(ctx context.Context, logger *zap.Logger, st *store.Store, q q
 		zap.Duration("staleness", cfg.WorkerReconcileStaleness),
 	)
 
+	if err := reconcileOnce(ctx, logger, st, q, cfg, onDeadLetter); err != nil {
+		logger.Warn("reconcile pass failed", zap.Error(err))
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			logger.Info("reconciler stopped")
 			return
 		case <-ticker.C:
-			if err := reconcileOnce(ctx, logger, st, q, cfg); err != nil {
+			if err := reconcileOnce(ctx, logger, st, q, cfg, onDeadLetter); err != nil {
 				logger.Warn("reconcile pass failed", zap.Error(err))
 			}
 		}
@@ -64,7 +84,7 @@ func runReconciler(ctx context.Context, logger *zap.Logger, st *store.Store, q q
 }
 
 // reconcileOnce sweeps one batch of stale tasks and applies the two-case split.
-func reconcileOnce(ctx context.Context, logger *zap.Logger, st *store.Store, q queue.Broker, cfg *config.Config) error {
+func reconcileOnce(ctx context.Context, logger *zap.Logger, st *store.Store, q queue.Broker, cfg *config.Config, onDeadLetter DeadLetterFunc) error {
 	cutoff := time.Now().Add(-cfg.WorkerReconcileStaleness)
 
 	stale, err := st.ListStaleTasks(ctx, cutoff, 100)
@@ -83,7 +103,7 @@ func reconcileOnce(ctx context.Context, logger *zap.Logger, st *store.Store, q q
 
 		switch decideReconcile(prior, cfg.WorkerMaxAttempts) {
 		case reconcileDeadLetter:
-			reconcileDeadLetterTask(ctx, logger, st, q, t, prior)
+			reconcileDeadLetterTask(ctx, logger, st, q, t, prior, onDeadLetter)
 		case reconcileRepublish:
 			reconcileRepublishTask(ctx, logger, st, q, t, prior)
 		}
@@ -128,7 +148,7 @@ func reconcileRepublishTask(ctx context.Context, logger *zap.Logger, st *store.S
 // reconcileDeadLetterTask terminally fails a stale task that has exhausted its
 // attempt budget, publishing a DLQ entry (references only — no document content)
 // and marking the task failed.
-func reconcileDeadLetterTask(ctx context.Context, logger *zap.Logger, st *store.Store, q queue.Broker, t *store.Task, prior int) {
+func reconcileDeadLetterTask(ctx context.Context, logger *zap.Logger, st *store.Store, q queue.Broker, t *store.Task, prior int, onDeadLetter DeadLetterFunc) {
 	reason := fmt.Errorf("reconciler: stale %s task exceeded max attempts (%d)", t.Status, prior)
 
 	// Claim the terminal transition first (optimistic lock) so only one replica
@@ -162,7 +182,9 @@ func reconcileDeadLetterTask(ctx context.Context, logger *zap.Logger, st *store.
 
 	// Dead-letter → document status wiring (same hook the worker's terminal
 	// paths use): a crash-pill document ends visibly failed at its stage.
-	notifyDeadLetter(ctx, t, reason)
+	if onDeadLetter != nil {
+		onDeadLetter(ctx, t, reason)
+	}
 
 	logger.Error("reconcile: dead-lettered stale task",
 		zap.String("task_id", t.ID.String()),
