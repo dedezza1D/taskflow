@@ -69,6 +69,46 @@ func TestLocalQueueDeliversQueuedWork(t *testing.T) {
 	}
 }
 
+// A delayed nak keeps the task out of reach until the delay passes, then gives
+// it back like a plain nak.
+func TestLocalQueueNakWithDelayHoldsTheTaskBack(t *testing.T) {
+	q, st := newLocalQueue(t)
+	ctx := context.Background()
+	task := enqueue(t, st, "demo")
+
+	msgs, err := q.Fetch(ctx, 1, 50*time.Millisecond)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("Fetch: %d messages, err %v", len(msgs), err)
+	}
+	const delay = 300 * time.Millisecond
+	if err := msgs[0].NakWithDelay(delay); err != nil {
+		t.Fatal(err)
+	}
+
+	early, err := q.Fetch(ctx, 1, 20*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(early) != 0 {
+		t.Fatal("task redelivered before its delay elapsed")
+	}
+
+	// The release wakes the fetch, so this returns shortly after the delay
+	// rather than at the end of the wait.
+	later, err := q.Fetch(ctx, 1, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(later) != 1 {
+		t.Fatal("task not redelivered after its delay")
+	}
+	var tm TaskMessage
+	_ = json.Unmarshal(later[0].Data(), &tm)
+	if tm.TaskID != task.ID.String() {
+		t.Fatalf("redelivered %s, want %s", tm.TaskID, task.ID)
+	}
+}
+
 // A task already handed out must not be handed out again until it is settled,
 // or two workers would do the same job concurrently.
 func TestLocalQueueDoesNotRedeliverInFlightWork(t *testing.T) {

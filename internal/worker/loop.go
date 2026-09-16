@@ -73,6 +73,12 @@ func (l *Loop) Run(ctx context.Context) {
 		msgs, err := l.Broker.Fetch(ctx, 1, l.Config.WorkerPollTimeout)
 		if err != nil {
 			l.Logger.Warn("fetch error", zap.Error(err))
+			// A broker that is down fails every fetch at once; without a pause
+			// this loop spins a core and floods the log until it comes back.
+			select {
+			case <-ctx.Done():
+			case <-time.After(l.Config.WorkerBackoffBase):
+			}
 			continue
 		}
 
@@ -87,23 +93,30 @@ func (l *Loop) Run(ctx context.Context) {
 				action, attempt, err := l.handleMsg(ctx, m)
 				if err != nil {
 					l.Logger.Error("handle message failed", zap.Error(err))
-					_ = m.Nak()
-					return
 				}
-
-				switch action {
-				case actionAck:
-					_ = m.Ack()
-				case actionRetry:
-					delay := computeBackoff(l.Config.WorkerBackoffBase, l.Config.WorkerBackoffMax, attempt)
-					time.Sleep(delay)
-					_ = m.Nak()
-				default:
-					_ = m.Ack()
-				}
+				l.settle(m, action, attempt)
 			}(m)
 		}
 	}
+}
+
+// settle tells the broker what became of a message.
+//
+// The action decides, not whether an error came back: handleMsg pairs an error
+// with actionAck for a message that can never succeed (unparseable body, bad
+// task id), and redelivering one of those only loops it forever.
+//
+// A retry is handed back with its backoff as a delivery delay rather than slept
+// through here. Sleeping held one of WorkerConcurrency slots for the whole wait —
+// a burst of failing tasks could stall healthy ones behind it — and ignored
+// shutdown, so stopping the worker waited out every pending backoff.
+func (l *Loop) settle(m queue.Message, action msgAction, attempt int) {
+	if action == actionRetry {
+		delay := computeBackoff(l.Config.WorkerBackoffBase, l.Config.WorkerBackoffMax, attempt)
+		_ = m.NakWithDelay(delay)
+		return
+	}
+	_ = m.Ack()
 }
 
 func (l *Loop) handleMsg(ctx context.Context, m queue.Message) (msgAction, int, error) {

@@ -110,3 +110,7 @@ func (m *natsMessage) Header() Header    { return Header(m.msg.Header) }
 func (m *natsMessage) Ack() error        { return m.msg.Ack() }
 func (m *natsMessage) Nak() error        { return m.msg.Nak() }
 func (m *natsMessage) InProgress() error { return m.msg.InProgress() }
+
+// NakWithDelay leaves the wait to the server, which holds the message back
+// durably — it survives this worker restarting mid-backoff.
+func (m *natsMessage) NakWithDelay(delay time.Duration) error { return m.msg.NakWithDelay(delay) }

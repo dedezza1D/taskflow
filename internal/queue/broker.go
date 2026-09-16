@@ -61,6 +61,10 @@ type Message interface {
 	Ack() error
 	// Nak returns the message for redelivery.
 	Nak() error
+	// NakWithDelay returns the message for redelivery no sooner than delay from
+	// now. It is how a retry backs off without the worker holding a
+	// concurrency slot for the whole wait.
+	NakWithDelay(delay time.Duration) error
 	// InProgress is the liveness heartbeat that keeps a long-running handler's
 	// claim alive — see worker.RunWithLease.
 	InProgress() error
